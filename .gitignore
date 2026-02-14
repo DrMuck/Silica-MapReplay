@@ -1,0 +1,19 @@
+# Raw game assets (packed into assets.pak)
+Assets/
+
+# User-specific Python path config (auto-generated on first run)
+python_config.bat
+
+# Generated replays
+Replays/
+
+# Log files
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor files
+.vscode/
+*.swp
