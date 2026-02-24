@@ -51,8 +51,9 @@ except ImportError:
 # Import modules (after path is set up)
 import numpy as np
 import config as cfg
-from data_models import Building, KillEvent, DeathEvent, VictoryInfo, Resource, ChatMessage
-from statistics import build_all_stats_from_log, build_player_stats_from_kills
+from data_models import Building, KillEvent, DeathEvent, VictoryInfo, Resource, ChatMessage, ResourceStatusEvent
+from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_resource_stats_from_log, build_kill_stats_from_srpl
+from srpl_reader import LiveSrplReader
 from renderer import render_frame, render_scoreboard, clear_render_cache
 import gc  # For garbage collection
 
@@ -552,7 +553,8 @@ class LiveGameState:
         self.resources = {}
         self.team_tech_events = defaultdict(list)
         self.chat_messages = []  # Chat messages from players
-        
+        self.resource_status_events = []  # ResourceStatusEvent list for graph 2
+
         # Tracking
         self.kill_counter = 0
         self.last_event_time = start_time
@@ -663,7 +665,11 @@ class LiveLogParser:
             r'World triggered "Resource_Depleted" \(type "(?P<type>[^"]+)"\) '
             r'\(position "(?P<pos>[^"]+)"\)'
         )
-        
+        self.re_resource_status = re.compile(
+            r'Team "(?P<team>[^"]+)" triggered "resource_status" '
+            r'\(collected "(?P<collected>\d+)"\) \(spent "(?P<spent>\d+)"\)'
+        )
+
         # Chat events - "PlayerName<id><steamid><Team>" say "message" or say_team "message"
         self.re_chat_say = re.compile(
             r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>"\s+say\s+"(?P<message>.+)"'
@@ -1067,7 +1073,16 @@ class LiveLogParser:
                 event_processed = True
             except Exception as e:
                 self.logger.warning(f"Failed to parse resource depleted: {e}")
-        
+
+        # Resource status (team collected/spent totals for graph)
+        m_res_status = self.re_resource_status.search(line)
+        if m_res_status:
+            team = m_res_status.group("team")
+            collected = int(m_res_status.group("collected"))
+            spent = int(m_res_status.group("spent"))
+            game.resource_status_events.append(ResourceStatusEvent(t, team, collected, spent))
+            event_processed = True
+
         # Chat messages - say_team first (more specific)
         m_chat_team = self.re_chat_say_team.search(line)
         if m_chat_team:
@@ -1129,6 +1144,10 @@ class LiveFrameGenerator:
         self.base_map = None
         self.map_name = None
         self.last_frame_rgb = None  # Track last frame for freeze effect
+
+        # SRPL live reader for unit positions
+        self.srpl_reader: Optional[LiveSrplReader] = None
+        self.srpl_dir = str(Path(__file__).parent.parent / "Mods" / "ReplayLogs")
     
     def start_game(self, game: LiveGameState):
         """Initialize frame generation for a new game."""
@@ -1204,10 +1223,55 @@ class LiveFrameGenerator:
         
         # Ensure output directory exists
         self.config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        
+
+        # Try to find and open the matching SRPL file for unit positions
+        self._open_srpl_for_game(game)
+
         # Initialize first video file
         return self._start_new_video_file()
     
+    def _open_srpl_for_game(self, game: LiveGameState):
+        """Find and open the SRPL file matching this game."""
+        # Close any previous reader
+        if self.srpl_reader:
+            self.srpl_reader.close()
+            self.srpl_reader = None
+
+        if not os.path.isdir(self.srpl_dir):
+            self.logger.info(f"SRPL dir not found: {self.srpl_dir}")
+            return
+
+        # Find the most recent .srpl file for this map
+        # During a live game, the file was just created moments ago
+        best_path = None
+        best_mtime = 0
+        for fname in os.listdir(self.srpl_dir):
+            if not fname.endswith(".srpl"):
+                continue
+            if game.map_name and game.map_name not in fname:
+                continue
+            fpath = os.path.join(self.srpl_dir, fname)
+            mtime = os.path.getmtime(fpath)
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_path = fpath
+
+        if not best_path:
+            self.logger.info(f"No SRPL file found for map {game.map_name}")
+            return
+
+        # Only use if recently created (within last 120 seconds)
+        if time.time() - best_mtime > 120:
+            self.logger.info(f"SRPL file too old ({time.time() - best_mtime:.0f}s), skipping")
+            return
+
+        reader = LiveSrplReader(best_path)
+        if reader.open():
+            self.srpl_reader = reader
+            self.logger.info(f"SRPL live reader opened: {best_path}")
+        else:
+            self.logger.warning(f"Failed to open SRPL: {best_path}")
+
     def _start_new_video_file(self) -> bool:
         """Start a new video file (for initial or after split)."""
         # Close current writer if exists
@@ -1367,7 +1431,26 @@ class LiveFrameGenerator:
         for kill in game.kills:
             if kill.attacker_unit and kill.attacker_unit != "Unknown":
                 unit_kill_stats[kill.attacker_unit] += 1
-        
+
+        # Build resource stats for graph 2
+        resource_stats = None
+        if game.resource_status_events:
+            resource_stats = build_resource_stats_from_log(game.resource_status_events)
+
+        # Refresh SRPL data and override kill_stats with full kill data
+        srpl_replay = None
+        if not self.srpl_reader:
+            # Retry finding SRPL file (may not have existed at game start)
+            self._open_srpl_for_game(game)
+        if self.srpl_reader:
+            new_records = self.srpl_reader.refresh()
+            if new_records > 0:
+                self.logger.debug(f"SRPL: read {new_records} new records")
+            srpl_replay = self.srpl_reader.replay
+            # Override kill_stats with SRPL data (includes AI vs AI kills)
+            if srpl_replay and srpl_replay.destructions:
+                kill_stats = build_kill_stats_from_srpl(srpl_replay)
+
         # Generate frames
         start_t = game.last_frame_time
         end_t = game_time
@@ -1386,6 +1469,24 @@ class LiveFrameGenerator:
         
         for t in frame_times:
             try:
+                # Compute SRPL unit positions and dying units for this frame
+                srpl_units = None
+                dying_eids = None
+                if srpl_replay and srpl_replay.ticks:
+                    destroyed = srpl_replay.get_destroyed_before(t)
+                    all_pos = srpl_replay.get_positions_at_time(t)
+
+                    prev_t = t - cfg.FRAME_STEP
+                    if prev_t >= 0:
+                        prev_destroyed = srpl_replay.get_destroyed_before(prev_t)
+                        dying_eids = destroyed - prev_destroyed
+                    else:
+                        dying_eids = None
+
+                    srpl_units = [p for p in all_pos
+                                  if p["entity_id"] not in destroyed
+                                  or p["entity_id"] in (dying_eids or set())]
+
                 frame = render_frame(
                     self.base_map,
                     buildings,
@@ -1407,6 +1508,9 @@ class LiveFrameGenerator:
                     map_name=game.map_name,
                     log_date=game.game_datetime or game.log_date,  # Pass full datetime if available
                     chat_messages=game.chat_messages,  # Pass chat messages for chat panel
+                    resource_stats=resource_stats,
+                    unit_positions=srpl_units,
+                    dying_units=dying_eids,
                 )
                 
                 # Write frame - convert to numpy array and immediately write
@@ -1526,7 +1630,12 @@ class LiveFrameGenerator:
         self.base_map = None
         self.all_output_paths = []
         self.last_frame_rgb = None  # Clear last frame reference
-        
+
+        # Close SRPL reader
+        if self.srpl_reader:
+            self.srpl_reader.close()
+            self.srpl_reader = None
+
         # Clear render cache after game ends
         try:
             clear_render_cache()

@@ -32,7 +32,7 @@ from tqdm import tqdm
 # Import all modules
 import config
 from data_models import Building, KillEvent, DeathEvent
-from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_unit_kill_stats
+from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_unit_kill_stats, build_resource_stats_from_log, build_kill_stats_from_srpl
 from log_parser import parse_buildings_and_kills_from_log, world_to_pixel
 from renderer import render_frame, make_heatmap_image
 from icon_config import MISSING_ICON_TYPES
@@ -146,7 +146,8 @@ def process_replay(
     resolution="1440p",
     test_mode=False,
     gametype_filter=None,  # None = any game type, or specify e.g. "HUMANS_VS_HUMANS_VS_ALIENS"
-    game_index=0  # Which matching game to parse (0 = first, 1 = second, etc.)
+    game_index=0,  # Which matching game to parse (0 = first, 1 = second, etc.)
+    srpl_path=None  # Optional .srpl file for unit position overlay
 ):
     """
     Process a single replay video.
@@ -171,18 +172,21 @@ def process_replay(
     config.TEST_MODE = test_mode
     config.GAMETYPE_FILTER = gametype_filter
     config.GAME_INDEX = game_index
+    config.SRPL_PATH = srpl_path
     config.set_resolution(resolution)
-    
+
     # Also set in icon_config
     import icon_config
     icon_config.ICON_DIR = icon_dir
-    
+
     print(f"Processing replay:")
     print(f"  Log: {log_path}")
     print(f"  Map: {map_path}")
     print(f"  Output: {output_path}")
     print(f"  Resolution: {resolution}")
     print(f"  World extent: {world_extent}")
+    if srpl_path:
+        print(f"  SRPL: {srpl_path}")
     print()
     
     # Run video generation
@@ -211,17 +215,37 @@ def make_video():
     # === PHASE 1: Log Parsing ===
     timing.start('log_parsing')
     game_index = getattr(config, 'GAME_INDEX', 0)
-    buildings, kills, deaths, commanders, team_tech_events, resources, victory_info, t_start, t_end, game_info, chat_messages = \
+    buildings, kills, deaths, commanders, team_tech_events, resources, victory_info, t_start, t_end, game_info, chat_messages, resource_status_events = \
         parse_buildings_and_kills_from_log(config.LOG_PATH, config.GAMETYPE_FILTER, game_index)
     timing.stop('log_parsing')
 
-    
+    # === PHASE 1b: SRPL Loading (optional) ===
+    srpl_replay = None
+    srpl_path = getattr(config, 'SRPL_PATH', None)
+    if srpl_path:
+        try:
+            from srpl_reader import parse_srpl
+            print(f"Loading SRPL: {srpl_path}")
+            srpl_replay = parse_srpl(srpl_path)
+            print(f"  Entities: {len(srpl_replay.entities)}, Ticks: {len(srpl_replay.ticks)}, "
+                  f"Duration: {srpl_replay.duration_seconds:.0f}s, Players: {len(srpl_replay.players)}")
+        except Exception as e:
+            print(f"[WARN] Failed to load SRPL: {e}")
+            srpl_replay = None
+
     # === PHASE 2: Statistics Building ===
     timing.start('stats_building')
     print("Building team statistics...")
     kill_stats, building_stats = build_all_stats_from_log(buildings, kills, team_tech_events=team_tech_events)
     print(f"Kill stats built for teams: {list(kill_stats.keys())}")
     print(f"Building stats built for teams: {list(building_stats.keys())}")
+
+    # If SRPL data available, rebuild kill_stats from ALL destructions (including AI vs AI)
+    # The log-based kills list is kept for the killbar (player-related kills only)
+    if srpl_replay:
+        kill_stats = build_kill_stats_from_srpl(srpl_replay)
+        total_kills = sum(s.killed_units + s.killed_buildings for s in kill_stats.values())
+        print(f"Kill stats rebuilt from SRPL: {total_kills} total kills (all, incl. AI vs AI)")
     
     # Build player statistics
     print("Building player statistics...")
@@ -238,10 +262,14 @@ def make_video():
     
     # Build unit kill statistics
     unit_kill_stats = build_unit_kill_stats(kills)
-    
+
+    # Build resource stats for graph 2
+    resource_stats = build_resource_stats_from_log(resource_status_events)
+
     print(f"Player stats built for {len(player_stats)} players")
     print(f"Unit kill stats: {len(unit_kill_stats)} unit types tracked")
     print(f"Resources parsed: {len(resources)}")
+    print(f"Resource stats built for teams: {list(resource_stats.keys())}")
     if victory_info:
         print(f"Victory info: {victory_info.end_type}" + (f" - {victory_info.winning_team}" if victory_info.winning_team else ""))
     timing.stop('stats_building')
@@ -437,6 +465,27 @@ def make_video():
             render_start = time.perf_counter()
             render_detail = {}  # Collect detailed timing from render_frame
             
+            # Get unit positions from SRPL if available
+            srpl_units = None
+            dying_eids = None
+            if srpl_replay:
+                game_t = float(t) - t_start  # Convert absolute time to game-relative time
+                destroyed = srpl_replay.get_destroyed_before(game_t)
+                all_pos = srpl_replay.get_positions_at_time(game_t)
+
+                # Find units dying on this tick (destroyed between prev frame and now)
+                prev_game_t = game_t - config.FRAME_STEP
+                if prev_game_t >= 0:
+                    prev_destroyed = srpl_replay.get_destroyed_before(prev_game_t)
+                    dying_eids = destroyed - prev_destroyed  # Newly destroyed this frame
+                else:
+                    prev_destroyed = set()
+                    dying_eids = None
+
+                # Include alive units + dying units (for death flash), exclude already-dead
+                srpl_units = [p for p in all_pos
+                              if p["entity_id"] not in destroyed or p["entity_id"] in (dying_eids or set())]
+
             frame = render_frame(
                 base_map,
                 buildings,
@@ -458,6 +507,9 @@ def make_video():
                 map_name=map_name,
                 log_date=map_info_display,  # Contains date + time for display
                 chat_messages=chat_messages,
+                resource_stats=resource_stats,
+                unit_positions=srpl_units,
+                dying_units=dying_eids,
             )
             
             frame_num += 1  # Increment frame counter
@@ -507,7 +559,7 @@ def make_video():
             print(f"Scoreboard added: {scoreboard_frames} frames ({scoreboard_frames / config.VIDEO_FPS:.1f}s)")
                 
     except KeyboardInterrupt:
-        print("\n\nÃ¢Å¡Â Ã¯Â¸Â  Rendering cancelled by user (Ctrl+C)")
+        print("\n\n" + chr(0x26A0) + chr(0xFE0F) + "  Rendering cancelled by user (Ctrl+C)")
         cancelled = True
     finally:
         writer.close()

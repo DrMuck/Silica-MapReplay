@@ -167,7 +167,7 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
     re_tech_change = re.compile(r'Team "(?P<team>[^"]+)" triggered "technology_change" \(tier "(?P<tier>\d+)"\)')
     
     re_struct_kill = re.compile(
-        r'"([^"<]+)<[^>]*><[^>]*><([^">]*)>" triggered "structure_kill" '
+        r'"([^"<]+)<([^>]*)><[^>]*><([^">]*)>" triggered "structure_kill" '
         r'\(structure "([^"]+)"\).*?\(struct_team "([^"]*)"\).*?\(building_position "([^"]+)"\)'
     )
     
@@ -422,8 +422,8 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
         # Structure kill
         m_s = re_struct_kill.search(line)
         if m_s:
-            attacker_name, attacker_team = m_s.group(1), m_s.group(2) or "Unknown"
-            struct_name, victim_team, pos_str = m_s.group(3), m_s.group(4) or "Unknown", m_s.group(5)
+            attacker_name, attacker_steamid, attacker_team = m_s.group(1), m_s.group(2), m_s.group(3) or "Unknown"
+            struct_name, victim_team, pos_str = m_s.group(4), m_s.group(5) or "Unknown", m_s.group(6)
             weapon_match = re.search(r'\(weapon "([^"]+)"\)', line)
             attacker_unit = weapon_match.group(1) if weapon_match else "Unknown"
             try:
@@ -437,6 +437,9 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
                 rec["team"], rec["name"], rec["x"], rec["y"] = victim_team, struct_name, x, y
             if rec["destroy_t"] is None:
                 rec["destroy_t"] = t
+            # Skip AI structure kills (no steamID = AI attacker)
+            if not attacker_steamid:
+                continue
             kill_counter += 1
             kills.append(KillEvent(t, x, y, victim_team, struct_name, attacker_team, attacker_unit, x, y, attacker_name, struct_name, True, kill_counter))
             continue

@@ -51,7 +51,8 @@ MIN_GAME_DURATION = 600  # 10 minutes
 
 # Seconds to wait after last event before considering game ended
 # (Fallback if Round_Win event is missed)
-GAME_END_TIMEOUT = 60
+# Note: resource_status events only fire every 60s, so this must be >60
+GAME_END_TIMEOUT = 180
 
 # Disable timeout-based game ending (for emulator testing)
 # When True, games only end on Round_Win/Victory or new Round_Start

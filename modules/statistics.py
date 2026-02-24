@@ -261,6 +261,43 @@ def build_unit_kill_stats(kills):
     return unit_kills
 
 
+def build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien"]):
+    """
+    Build TeamStats from SRPL destruction events (includes ALL kills, not just player-related).
+
+    Args:
+        srpl_replay: SrplReplay object with .destructions and .entities
+        teams: list of team names
+
+    Returns:
+        dict: {team_name: TeamStats}
+    """
+    stats = {team: TeamStats(team) for team in teams}
+
+    for tick, victim_id, attacker_id, is_building in sorted(srpl_replay.destructions, key=lambda d: d[0]):
+        time_s = srpl_replay.tick_to_seconds(tick)
+        victim_ent = srpl_replay.entities.get(victim_id)
+        attacker_ent = srpl_replay.entities.get(attacker_id)
+
+        if victim_ent is None:
+            continue
+
+        victim_team = victim_ent.team_name
+        attacker_team = attacker_ent.team_name if attacker_ent else "Unknown"
+
+        is_teamkill = (attacker_team == victim_team)
+
+        # Victim team records a loss
+        if victim_team in stats:
+            stats[victim_team].record_loss(time_s, is_building)
+
+        # Attacker team gets credit (skip teamkills)
+        if attacker_team in stats:
+            stats[attacker_team].record_kill(time_s, is_building, is_teamkill=is_teamkill)
+
+    return stats
+
+
 def build_resource_stats_from_log(resource_status_events, teams=["Sol", "Centauri", "Alien"]):
     """
     Build ResourceStats objects from resource_status events parsed from the log.

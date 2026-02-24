@@ -53,6 +53,22 @@ def get_icon_scale():
     return config.ICON_SCALE
 
 
+# Team prefixes to strip from AI unit names in killbar
+_TEAM_PREFIXES = ("Sol_", "Cent_", "Alien_")
+
+def _clean_killbar_name(name):
+    """Strip team prefixes from AI unit names for cleaner killbar display."""
+    for prefix in _TEAM_PREFIXES:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+def _filter_kills_for_killbar(kills, current_time):
+    """Filter and clean kills for killbar display (no structure kills)."""
+    past_kills = [k for k in kills if k.time <= current_time and not k.is_structure]
+    return sorted(past_kills, key=lambda k: k.time, reverse=True)
+
+
 def load_font(size: int):
     try:
         return ImageFont.truetype("arial.ttf", size)
@@ -147,23 +163,23 @@ class KillbarScrollBuffer:
             self.height = height
         
         # FAST PATH: Check if any new kills since last check
-        # Count kills up to current_time (kills are sorted by time)
+        # Count non-structure kills up to current_time
         current_kill_count = 0
         for k in kills:
             if k.time <= current_time:
-                current_kill_count += 1
+                if not k.is_structure:
+                    current_kill_count += 1
             else:
                 break
-        
+
         # If no new kills and we have a buffer, return cached
-        if (self.buffer_image is not None and 
+        if (self.buffer_image is not None and
             current_kill_count == self.last_kill_count):
             return self.buffer_image
-        
+
         # New kills detected - need to process
-        # Get current kills (sorted by time, most recent first)
-        past_kills = kills[:current_kill_count]  # Already sorted, just slice
-        recent_kills = list(reversed(past_kills))[:self.max_entries]  # Reverse for most recent first
+        # Get current kills (sorted by time, most recent first), excluding structures
+        recent_kills = _filter_kills_for_killbar(kills, current_time)[:self.max_entries]
         current_kill_ids = [k.kill_number for k in recent_kills]
         
         # CASE 1: No change in visible kills - return cached
@@ -272,27 +288,27 @@ class KillbarScrollBuffer:
             panel.alpha_composite(attacker_icon, (x_pos, icon_y))
         x_pos += config.KILLBAR_ICON_SIZE + sp['icon_to_name']
         
-        # Attacker name
-        attacker_name = kill.attacker_name[:KILLBAR_NAME_MAX_CHARS]
+        # Attacker name (strip team prefixes from AI names)
+        attacker_name = _clean_killbar_name(kill.attacker_name)[:KILLBAR_NAME_MAX_CHARS]
         attacker_color = TEAM_COLORS.get(kill.attacker_team, (255, 255, 255))
-        draw.text((x_pos, y_pos + self.entry_height // 2), attacker_name, 
+        draw.text((x_pos, y_pos + self.entry_height // 2), attacker_name,
                  font=font, fill=(*attacker_color, 255), anchor="lm")
         x_pos += sp['name_width'] + sp['name_to_symbol']
-        
+
         # Kill symbol
-        draw.text((x_pos, y_pos + self.entry_height // 2), KILLBAR_KILL_SYMBOL, 
+        draw.text((x_pos, y_pos + self.entry_height // 2), KILLBAR_KILL_SYMBOL,
                  font=font, fill=(255, 255, 255, 255), anchor="lm")
         x_pos += sp['symbol_width'] + sp['symbol_to_icon']
-        
+
         # Victim Icon
         victim_icon = get_icon(kill.victim_unit, kill.victim_team, "complete", config.KILLBAR_ICON_SIZE / 64.0)
         if victim_icon:
             icon_y = y_pos + (self.entry_height - victim_icon.height) // 2
             panel.alpha_composite(victim_icon, (x_pos, icon_y))
         x_pos += config.KILLBAR_ICON_SIZE + sp['icon_to_name']
-        
-        # Victim name
-        victim_name = kill.victim_name[:KILLBAR_NAME_MAX_CHARS]
+
+        # Victim name (strip team prefixes from AI names)
+        victim_name = _clean_killbar_name(kill.victim_name)[:KILLBAR_NAME_MAX_CHARS]
         victim_color = TEAM_COLORS.get(kill.victim_team, (255, 255, 255))
         draw.text((x_pos, y_pos + self.entry_height // 2), victim_name, 
                  font=font, fill=(*victim_color, 255), anchor="lm")
@@ -833,25 +849,24 @@ def render_killbar(draw, kills, current_time, font, number_font):
     """
     if not ENABLE_KILLBAR or not kills:
         return
-    
-    past_kills = [k for k in kills if k.time <= current_time]
-    recent_kills = sorted(past_kills, key=lambda k: k.time, reverse=True)[:config.KILLBAR_MAX_ENTRIES]
-    
+
+    recent_kills = _filter_kills_for_killbar(kills, current_time)[:config.KILLBAR_MAX_ENTRIES]
+
     if not recent_kills:
         return
-    
+
     x_start = KILLBAR_POSITION_X
     y_start = KILLBAR_POSITION_Y
-    
+
     # Use full killbar width (minus small margins)
     bg_width = config.KILLBAR_WIDTH - (KILLBAR_POSITION_X * 2)  # Account for left/right padding
     bg_height = len(recent_kills) * config.KILLBAR_ENTRY_HEIGHT + 10
     draw.rectangle([(x_start, y_start), (x_start + bg_width, y_start + bg_height)], fill=(0, 0, 0, KILLBAR_BG_ALPHA))
-    
+
     # Calculate spacings based on font size
     fs = config.KILLBAR_FONT_SIZE
     sp = KILLBAR_SPACING_FACTORS
-    
+
     number_width = int(fs * sp["number_width"])
     icon_to_name = getattr(config, 'KILLBAR_ICON_TO_NAME_OFFSET', int(fs * sp["icon_to_name"]))
     name_width = int(fs * sp["name_width"])
@@ -859,23 +874,23 @@ def render_killbar(draw, kills, current_time, font, number_font):
     symbol_width = int(fs * sp["symbol_width"])
     symbol_to_icon = int(fs * sp["symbol_to_icon"])
     timestamp_gap = int(fs * sp["timestamp_gap"])
-    
+
     y_current = y_start + 5
-    
+
     for kill in recent_kills:
         x_pos = x_start + 5
-        
+
         # Kill number
         if KILLBAR_SHOW_KILL_NUMBER:
             kill_num_str = f"#{kill.kill_number}"
             draw.text((x_pos, y_current + config.KILLBAR_ENTRY_HEIGHT // 2), kill_num_str, font=number_font, fill=(200, 200, 200, 255), anchor="lm")
             x_pos += number_width
-        
+
         # Space for attacker icon (rendered separately)
         x_pos += config.KILLBAR_ICON_SIZE + icon_to_name
-        
-        # Attacker name
-        attacker_name = kill.attacker_name[:KILLBAR_NAME_MAX_CHARS]
+
+        # Attacker name (strip team prefixes from AI names)
+        attacker_name = _clean_killbar_name(kill.attacker_name)[:KILLBAR_NAME_MAX_CHARS]
         attacker_color = TEAM_COLORS.get(kill.attacker_team, (255, 255, 255))
         draw.text((x_pos, y_current + config.KILLBAR_ENTRY_HEIGHT // 2), attacker_name, font=font, fill=(*attacker_color, 255), anchor="lm")
         x_pos += name_width + name_to_symbol
@@ -886,19 +901,19 @@ def render_killbar(draw, kills, current_time, font, number_font):
         
         # Space for victim icon (rendered separately)
         x_pos += config.KILLBAR_ICON_SIZE + icon_to_name
-        
-        # Victim name
-        victim_name = kill.victim_name[:KILLBAR_NAME_MAX_CHARS]
+
+        # Victim name (strip team prefixes from AI names)
+        victim_name = _clean_killbar_name(kill.victim_name)[:KILLBAR_NAME_MAX_CHARS]
         victim_color = TEAM_COLORS.get(kill.victim_team, (255, 255, 255))
         draw.text((x_pos, y_current + config.KILLBAR_ENTRY_HEIGHT // 2), victim_name, font=font, fill=(*victim_color, 255), anchor="lm")
         x_pos += name_width + timestamp_gap
-        
+
         # Timestamp
         minutes = int(kill.time // 60)
         seconds = int(kill.time % 60)
         timestamp_str = f"{minutes:02d}:{seconds:02d}"
         draw.text((x_pos, y_current + config.KILLBAR_ENTRY_HEIGHT // 2), timestamp_str, font=number_font, fill=(180, 180, 180, 255), anchor="lm")
-        
+
         y_current += config.KILLBAR_ENTRY_HEIGHT
 
 
@@ -908,10 +923,9 @@ def render_killbar_icons(frame, kills, current_time, map_width):
     """Composite killbar icons with consistent spacing."""
     if not ENABLE_KILLBAR or not kills:
         return
-    
-    past_kills = [k for k in kills if k.time <= current_time]
-    recent_kills = sorted(past_kills, key=lambda k: k.time, reverse=True)[:config.KILLBAR_MAX_ENTRIES]
-    
+
+    recent_kills = _filter_kills_for_killbar(kills, current_time)[:config.KILLBAR_MAX_ENTRIES]
+
     if not recent_kills:
         return
     
@@ -2559,7 +2573,7 @@ def render_stats_panel(kill_stats, building_stats, player_stats, unit_kill_stats
 
 
 
-def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, chat_messages=None, resource_stats=None):
+def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, chat_messages=None, resource_stats=None, unit_positions=None, dying_units=None):
     """
     Render one frame at game time t (seconds).
     Layout: [MAP | KILLBAR | STATS PANEL]
@@ -2693,6 +2707,70 @@ def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_
             draw.ellipse((x_px - r, y_px - r, x_px + r, y_px + r), fill=(col[0], col[1], col[2], 200))
 
     t_start_time = record_time('buildings', t_start_time)
+
+    # --- Unit Positions (from .srpl data) ---
+    if unit_positions:
+        dying_set = set(dying_units or [])
+        # Only render units (buildings already rendered from log data)
+        units_only = [up for up in unit_positions if up.get("is_unit", True)]
+        for up in units_only:
+            team = up.get("team_name", "")
+            type_name = up.get("type_name", "")
+            x_px, y_px = world_to_pixel(up["x"], up["y"], map_w, map_h, world_extent)
+            is_player = up.get("controller_name") is not None
+            eid = up.get("entity_id")
+            is_dying = eid in dying_set
+
+            # Convert display name to ICON_MAP key (remove spaces, handle special cases)
+            icon_key = type_name.replace(" ", "")
+            if icon_key == "HornedCrab":
+                icon_key = "CrabHorned"
+
+            # Scale units like kill icons in the base mod: soldiers smaller, vehicles/structures larger
+            if is_soldier(icon_key):
+                unit_scale = config.ICON_SCALE * config.KILL_SOLDIER_SCALE
+            else:
+                unit_scale = config.ICON_SCALE * config.KILL_ICON_SCALE
+
+            # Dying units: flash white
+            if is_dying:
+                icon = get_icon(icon_key, team, "flash", unit_scale)
+            else:
+                icon = get_icon(icon_key, team, "complete", unit_scale)
+
+            if icon is not None:
+                # AI units: very slightly transparent
+                if not is_player and not is_dying:
+                    icon = icon.copy()
+                    alpha_band = icon.split()[3]
+                    alpha_band = alpha_band.point(lambda a: int(a * 0.88))
+                    icon.putalpha(alpha_band)
+                iw, ih = icon.size
+                frame.alpha_composite(icon, (int(x_px - iw / 2), int(y_px - ih / 2)))
+
+                # Player name label above the icon
+                if is_player:
+                    pname = up["controller_name"]
+                    name_font = get_cached_font(config.KILL_NUMBER_FONT_SIZE)
+                    bbox = name_font.getbbox(pname)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                    nx = int(x_px - tw / 2)
+                    ny = int(y_px - ih / 2 - th - 2)
+                    # Dark outline for readability
+                    for ox, oy in ((-1,-1),(-1,1),(1,-1),(1,1),(0,-1),(0,1),(-1,0),(1,0)):
+                        draw.text((nx+ox, ny+oy), pname, font=name_font, fill=(0, 0, 0, 220))
+                    team_col = TEAM_COLORS.get(team, (255, 255, 255))
+                    draw.text((nx, ny), pname, font=name_font, fill=(team_col[0], team_col[1], team_col[2], 255))
+            else:
+                # Fallback: colored dot (white if dying)
+                col = (255, 255, 255) if is_dying else TEAM_COLORS.get(team, (200, 200, 200))
+                r = 3 if is_player else 2
+                alpha = 255 if is_dying else (200 if is_player else 100)
+                draw.ellipse((x_px - r, y_px - r, x_px + r, y_px + r),
+                             fill=(col[0], col[1], col[2], alpha))
+
+    t_start_time = record_time('unit_positions', t_start_time)
 
     # --- Kill Icons and Attack Lines ---
     if ENABLE_KILL_ICONS:
