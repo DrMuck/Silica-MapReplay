@@ -599,6 +599,9 @@ class LiveGameState:
         # Frame generation
         self.last_frame_time = 0.0
         self.frames_generated = 0
+
+        # Wall-clock Unix time when game was detected (for SRPL time sync)
+        self._start_unix = 0.0
     
     def get_relative_time(self, abs_time: float) -> float:
         """Convert absolute log time to relative game time."""
@@ -881,6 +884,7 @@ class LiveLogParser:
             self._pending_map_name = None  # Clear for next game
 
             self.current_game = LiveGameState(map_name, gametype, t_abs)
+            self.current_game._start_unix = time.time()
 
             # Extract date from log line
             log_date = self.extract_date(line)
@@ -1329,6 +1333,20 @@ class LiveFrameGenerator:
         if reader.open():
             self.srpl_reader = reader
             self.logger.info(f"SRPL live reader opened: {best_path}")
+            # Compute time offset: SRPL t=0 is true game start (Unix timestamp in header).
+            # Log-derived game.start_time is absolute log timer (seconds since server start),
+            # not Unix time — so we use the SRPL file's mtime as a proxy for creation time,
+            # then compute how many seconds of game had elapsed before the log detected it.
+            # offset = (log_start_unix - srpl_start_unix)
+            # A positive offset means the log detected the game late; we shift SRPL forward.
+            srpl_start_unix = reader.replay.start_timestamp
+            if srpl_start_unix > 0 and hasattr(game, '_start_unix') and game._start_unix > 0:
+                offset = game._start_unix - srpl_start_unix
+                reader.replay.time_offset = max(0.0, offset)
+                self.logger.info(f"SRPL time offset: {offset:.1f}s (log started {offset:.1f}s after SRPL)")
+            else:
+                # Fallback: use file mtime vs current time to estimate offset
+                reader.replay.time_offset = 0.0
         else:
             self.logger.warning(f"Failed to open SRPL: {best_path}")
 

@@ -74,6 +74,12 @@ class SrplReplay:
         self.max_tick = 0
         self.duration_seconds = 0.0
 
+        # Time offset (seconds) to add to requested time before SRPL lookup.
+        # Accounts for the gap between true game start (SRPL t=0) and the
+        # log parser's game start (first log event, which may be 10-60s later).
+        # Set externally by the service after opening the SRPL.
+        self.time_offset = 0.0
+
     def tick_to_seconds(self, tick):
         """Convert tick number to game time in seconds."""
         return tick * self.tick_interval_ms / 1000.0
@@ -99,33 +105,59 @@ class SrplReplay:
 
     def get_positions_at_time(self, t):
         """
-        Get all unit positions at game time t (seconds).
+        Get all unit positions at game time t (seconds), with linear interpolation
+        between ticks to avoid units jumping every tick_interval.
+
+        Applies self.time_offset to align SRPL time with log-derived game time.
 
         Returns list of dicts with keys:
             entity_id, team_name, type_name, is_unit, x, y,
             controller_name (or None for AI)
         """
-        tick = self.seconds_to_tick(t)
+        # Apply offset: convert log-relative time to SRPL-relative time
+        srpl_t = t + self.time_offset
+        tick_f = srpl_t * 1000.0 / self.tick_interval_ms  # fractional tick
 
-        # Find the closest tick <= requested tick
-        best_tick = None
+        # Find bracketing ticks
+        prev_tick = None
+        next_tick = None
         for tn in self.tick_numbers:
-            if tn <= tick:
-                best_tick = tn
+            if tn <= tick_f:
+                prev_tick = tn
             else:
+                next_tick = tn
                 break
 
-        if best_tick is None:
+        if prev_tick is None:
             return []
 
-        positions = self.ticks.get(best_tick, {})
+        prev_pos = self.ticks.get(prev_tick, {})
+
+        # Compute interpolation alpha (0.0 = prev tick, 1.0 = next tick)
+        if next_tick is not None and next_tick != prev_tick:
+            alpha = (tick_f - prev_tick) / (next_tick - prev_tick)
+            alpha = max(0.0, min(1.0, alpha))
+            next_pos = self.ticks.get(next_tick, {})
+        else:
+            alpha = 0.0
+            next_pos = {}
+
         result = []
-        for eid, (x, y) in positions.items():
+        # Use the tick closest to query for controller lookup
+        ref_tick = next_tick if (alpha >= 0.5 and next_tick is not None) else prev_tick
+        for eid, (x0, y0) in prev_pos.items():
             entity = self.entities.get(eid)
             if entity is None:
                 continue
+            # Interpolate position if entity also exists in next tick
+            if alpha > 0.0 and eid in next_pos:
+                x1, y1 = next_pos[eid]
+                x = x0 + alpha * (x1 - x0)
+                y = y0 + alpha * (y1 - y0)
+            else:
+                x, y = float(x0), float(y0)
             # Resolve current controller
-            ctrl_id = self.get_controller_at_tick(eid, tick)
+            ctrl_id = self.get_controller_at_tick(eid, ref_tick)
             ctrl_name = None
             if ctrl_id > 0:
                 pinfo = self.players.get(ctrl_id)
