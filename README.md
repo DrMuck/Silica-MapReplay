@@ -28,6 +28,7 @@ Silica Dedicated Server/
 |   +-- Start_MapReplay_Service.bat  # Easy launcher (auto-detects Python)
 |   +-- Run_Emulator.bat             # Easy emulator launcher
 |   +-- live_config.py               # Live service configuration
+|   +-- extract_game_assets.py       # Re-extract assets from game files after updates (developer tool)
 |   +-- pack_assets.py               # Asset packer (developer tool)
 |   +-- assets.pak                   # Packed game assets (maps + icons)
 |   +-- modules/                     # Core modules
@@ -225,10 +226,30 @@ Replays are saved to `Replays/` folder with format:
 
 Game assets (map images and unit icons) are stored in `assets.pak`, a compressed binary file. This keeps game assets from being directly browsable while allowing the mod to load them at runtime.
 
-If you need to repack assets after modifications (developer use only):
+### Updating assets after a game update (developer)
+
+When Silica updates and adds new maps or changes icons, run `extract_game_assets.py` to re-extract assets directly from the game files and rebuild `assets.pak`:
+
 ```batch
-python pack_assets.py
+pip install UnityPy Pillow
+python extract_game_assets.py
 ```
+
+This reads from the game client's `sharedassets0.assets` file via UnityPy — no manual AssetRipper step needed. The script:
+1. Auto-detects the Silica install location (or pass `--game-dir "D:/Silica"`)
+2. Extracts all map textures and `Tac_*` unit icons
+3. Computes correct world extents from terrain data
+4. Rebuilds `assets.pak` ready for deployment
+
+Options:
+```
+python extract_game_assets.py                          # extract + rebuild assets.pak (default)
+python extract_game_assets.py --extract-only           # extract PNGs to Assets/ folder only
+python extract_game_assets.py --pak-only               # rebuild assets.pak from existing Assets/
+python extract_game_assets.py --game-dir "D:/Silica"   # custom game install path
+```
+
+After running, copy the updated `assets.pak` to the server's `Mod MapReplay/` folder.
 
 The mod falls back to loading from the raw `Assets/` folder if `assets.pak` is not found, which is useful during development.
 
