@@ -109,7 +109,8 @@ class LiveConfig:
             cls.MIN_GAME_DURATION = getattr(live_cfg, 'MIN_GAME_DURATION', 600)
             cls.GAME_END_TIMEOUT = getattr(live_cfg, 'GAME_END_TIMEOUT', 60)
             cls.DISABLE_TIMEOUT_END = getattr(live_cfg, 'DISABLE_TIMEOUT_END', False)
-            
+            cls.SUPPRESS_CHAT_COMMANDS = getattr(live_cfg, 'SUPPRESS_CHAT_COMMANDS', True)
+
             # File splitting
             cls.MAX_FILE_SIZE_MB = getattr(live_cfg, 'MAX_FILE_SIZE_MB', 24)
             cls.FILE_SIZE_CHECK_INTERVAL = getattr(live_cfg, 'FILE_SIZE_CHECK_INTERVAL', 100)
@@ -119,7 +120,12 @@ class LiveConfig:
             cls.DISCORD_WEBHOOK_URL = getattr(live_cfg, 'DISCORD_WEBHOOK_URL', "")
             cls.DISCORD_UPLOAD_TIMEOUT = getattr(live_cfg, 'DISCORD_UPLOAD_TIMEOUT', 300)
             cls.DISCORD_RETRY_ATTEMPTS = getattr(live_cfg, 'DISCORD_RETRY_ATTEMPTS', 3)
-            
+            cls.SERVER_NAME = getattr(live_cfg, 'SERVER_NAME', "")
+            if not cls.SERVER_NAME:
+                cls.SERVER_NAME = cls._detect_server_name()
+            else:
+                cls.SERVER_NAME = cls._sanitize_server_name(cls.SERVER_NAME)
+
             # Memory optimization settings
             cls.VIDEO_BITRATE_KBPS = getattr(live_cfg, 'VIDEO_BITRATE_KBPS', 1900)
             cls.FFMPEG_PRESET = getattr(live_cfg, 'FFMPEG_PRESET', 'veryfast')
@@ -137,6 +143,7 @@ class LiveConfig:
     MIN_GAME_DURATION = 600  # Minimum game duration in seconds (10 min)
     GAME_END_TIMEOUT = 30  # Seconds to wait after last event before finalizing
     DISABLE_TIMEOUT_END = False  # Disable timeout-based game ending (for emulator testing)
+    SUPPRESS_CHAT_COMMANDS = True  # Suppress /b and /1-/30 chat commands from replay
     
     # Video settings
     VIDEO_RESOLUTION = "1440p"  # Options: "720p", "1080p", "1440p", "4k"
@@ -152,13 +159,40 @@ class LiveConfig:
     DISCORD_WEBHOOK_URL = ""  # Set in live_config.py
     DISCORD_UPLOAD_TIMEOUT = 300  # Timeout for upload in seconds
     DISCORD_RETRY_ATTEMPTS = 3  # Number of retry attempts for failed uploads
+    SERVER_NAME = ""  # Server name shown in Discord messages
     
     # Memory management
     MAX_PENDING_FRAMES = 1000  # Max frames to hold in memory before forcing write
-    
+
     # Logging
     LOG_LEVEL = logging.INFO
     LOG_FILE = SCRIPT_DIR / "mapreplay_service.log"
+
+    @classmethod
+    def _detect_server_name(cls):
+        """Auto-detect server name from ~/Documents/Silica/ServerSettings.xml."""
+        try:
+            import xml.etree.ElementTree as ET
+            settings_path = Path.home() / "Documents" / "Silica" / "ServerSettings.xml"
+            if settings_path.is_file():
+                tree = ET.parse(settings_path)
+                name = tree.getroot().get("ServerName", "")
+                if name:
+                    return cls._sanitize_server_name(name)
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _sanitize_server_name(name):
+        """Strip URLs from server name to avoid Discord link previews."""
+        import re
+        # Remove URLs (http/https/discord links etc.)
+        name = re.sub(r'https?://\S+', '', name)
+        # Clean up leftover separators and whitespace
+        name = re.sub(r'[|\s]+$', '', name)
+        name = re.sub(r'\|{2,}', '|', name)
+        return name.strip()
 
 
 # Load config from file at module load time
@@ -241,10 +275,11 @@ class DiscordUploader:
         E_CHART = chr(0x1F4CA)    # chart
         
         # Build message content
+        server_prefix = f"[{self.config.SERVER_NAME}] " if self.config.SERVER_NAME else ""
         if part_num > 0:
-            title = f"{E_GAME} **{map_name}** - {gametype} (Part {part_num}/{total_parts})"
+            title = f"{E_GAME} {server_prefix}**{map_name}** - {gametype} (Part {part_num}/{total_parts})"
         else:
-            title = f"{E_GAME} **{map_name}** - {gametype}"
+            title = f"{E_GAME} {server_prefix}**{map_name}** - {gametype}"
         
         # Add date if available
         date_str = ""
@@ -608,7 +643,7 @@ class LiveLogParser:
         self.re_round_start = re.compile(
             r'World triggered "Round_Start" \(gamemode "MP_Strategy"\) \(gametype "([^"]+)"\)'
         )
-        self.re_round_win = re.compile(r'World triggered "Round_Win"')
+        self.re_round_win = re.compile(r'World triggered "Round_Win"(?:.*\(gametype "(?P<gametype>[^"]+)"\))?')
         self.re_victory = re.compile(r'Team "(?P<team>[^"]+)" triggered "Victory"')
         self.re_loading_map = re.compile(r'Loading map "(?P<map>[^"]+)"')
         self.re_queued_map = re.compile(r'Queued map:\s*(?P<map>\S+)|Queued map: (?P<map2>\S+)')
@@ -677,7 +712,9 @@ class LiveLogParser:
         self.re_chat_say_team = re.compile(
             r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>"\s+say_team\s+"(?P<message>.+)"'
         )
-        
+        # Chat command filter (balance UI commands: /b, /1 through /30)
+        self.re_chat_command = re.compile(r'^/b\b|^/([12]?\d|30)\b')
+
         # Date extraction for cleanlog format
         self.re_date_cleanlog = re.compile(r'L (\d{2})/(\d{2})/(\d{4}) -')
     
@@ -798,11 +835,21 @@ class LiveLogParser:
                 self.current_game.map_name = map_name
                 self.logger.info(f"Map identified for current game: {map_name}")
         
-        # Check for game start
+        # Check for game start (Round_Start or auto-detect from first gameplay event)
         m_start = self.re_round_start.search(line)
-        if m_start:
-            gametype = m_start.group(1)
-            
+        is_gameplay_event = (not self.current_game or self.current_game.is_ended) and \
+            getattr(self, '_pending_map_name', None) and \
+            (self.re_construction.search(line) or self.re_resource_status.search(line) or
+             self.re_struct_kill.search(line))
+
+        if m_start or is_gameplay_event:
+            if m_start:
+                gametype = m_start.group(1)
+            else:
+                # Auto-detect: no Round_Start, infer gametype later from Round_Win
+                gametype = "HUMANS_VS_HUMANS_VS_ALIENS"  # default, updated on Round_Win
+                self.logger.info(f"Auto-detecting game start (no Round_Start event)")
+
             # End current game if one is running - remember its map name!
             previous_map = None
             if self.current_game and not self.current_game.is_ended:
@@ -810,8 +857,8 @@ class LiveLogParser:
                 self.current_game.is_ended = True
                 self.current_game.game_time = self.current_game.get_relative_time(t_abs)
                 self.completed_games.append(self.current_game)
-                self.logger.info(f"Previous game force-ended (new Round_Start)")
-            
+                self.logger.info(f"Previous game force-ended (new game detected)")
+
             # Use pending map name if available
             # Otherwise use previous game's map (for consecutive games on same map)
             # Otherwise "Unknown"
@@ -826,25 +873,25 @@ class LiveLogParser:
                     map_name = getattr(self, '_last_known_map', 'Unknown')
                     if map_name != 'Unknown':
                         self.logger.info(f"Using last known map: {map_name}")
-            
+
             # Remember this map for future games
             if map_name and map_name != "Unknown":
                 self._last_known_map = map_name
-            
+
             self._pending_map_name = None  # Clear for next game
-            
+
             self.current_game = LiveGameState(map_name, gametype, t_abs)
-            
+
             # Extract date from log line
             log_date = self.extract_date(line)
             if log_date:
                 self.current_game.log_date = log_date
-            
+
             # Also store full date for Discord message
             full_date = self.extract_full_date(line)
             if full_date:
                 self.current_game.full_date = full_date
-            
+
             # Extract full datetime for display and filename (YYYY/MM/DD - HH:MM)
             datetime_info = self.extract_full_datetime(line)
             if datetime_info:
@@ -853,7 +900,7 @@ class LiveLogParser:
                 # Also store components for filename
                 self.current_game.game_date_for_filename = date_str.replace("/", "-")  # YYYY-MM-DD
                 self.current_game.game_time_for_filename = time_str.replace(":", "")   # HHMM
-            
+
             self.logger.info(f"=== GAME STARTED === Map: {map_name}, Type: {gametype}, t={t_abs:.1f}s, Date: {self.current_game.game_datetime or log_date}")
             return "game_start"
         
@@ -865,10 +912,19 @@ class LiveLogParser:
         t = game.get_relative_time(t_abs)
         
         # Check for game end events
-        if self.re_round_win.search(line):
+        m_win = self.re_round_win.search(line)
+        if m_win:
+            # Update gametype from Round_Win if available (may have been unknown at start)
+            win_gametype = m_win.group("gametype")
+            if win_gametype and game.gametype != win_gametype:
+                self.logger.info(f"Gametype updated: {game.gametype} -> {win_gametype}")
+                game.gametype = win_gametype
             game.is_ended = True
             game.game_time = t
             self.completed_games.append(game)
+            # Re-arm pending map for consecutive games on same map (no Loading map between them)
+            if game.map_name and game.map_name != "Unknown":
+                self._pending_map_name = game.map_name
             self.logger.info(f"Game ended (Round_Win) at t={t:.1f}s")
             return "game_end"
         
@@ -1091,10 +1147,12 @@ class LiveLogParser:
             message = m_chat_team.group("message")
             # Only include messages from players with a valid team
             if team and team not in ("", "Unknown"):
-                game.chat_messages.append(ChatMessage(t, player_name, team, message, True))
-                self.logger.debug(f"Chat (team): {player_name} [{team}]: {message}")
-                event_processed = True
-        
+                # Filter out chat commands (balance UI: /b, /1-/30)
+                if not (LiveConfig.SUPPRESS_CHAT_COMMANDS and self.re_chat_command.search(message)):
+                    game.chat_messages.append(ChatMessage(t, player_name, team, message, True))
+                    self.logger.debug(f"Chat (team): {player_name} [{team}]: {message}")
+                    event_processed = True
+
         # Chat messages - say (global)
         if not m_chat_team:  # Only check if say_team didn't match
             m_chat = self.re_chat_say.search(line)
@@ -1104,9 +1162,11 @@ class LiveLogParser:
                 message = m_chat.group("message")
                 # Only include messages from players with a valid team
                 if team and team not in ("", "Unknown"):
-                    game.chat_messages.append(ChatMessage(t, player_name, team, message, False))
-                    self.logger.debug(f"Chat: {player_name} [{team}]: {message}")
-                    event_processed = True
+                    # Filter out chat commands (balance UI: /b, /1-/30)
+                    if not (LiveConfig.SUPPRESS_CHAT_COMMANDS and self.re_chat_command.search(message)):
+                        game.chat_messages.append(ChatMessage(t, player_name, team, message, False))
+                        self.logger.debug(f"Chat: {player_name} [{team}]: {message}")
+                        event_processed = True
         
         if event_processed:
             game.update_last_event(t_abs)
@@ -1857,6 +1917,9 @@ class MapReplayService:
                             self.logger.info(f"Game timeout: no log activity for {seconds_since_last_line:.0f}s, ending game")
                             game.is_ended = True
                             self.parser.current_game.is_ended = True
+                            # Re-arm pending map for next game auto-detect
+                            if game.map_name and game.map_name != "Unknown":
+                                self.parser._pending_map_name = game.map_name
                             
                             # Finalize the game
                             if self.frame_generator.current_game:

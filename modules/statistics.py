@@ -310,11 +310,22 @@ def build_resource_stats_from_log(resource_status_events, teams=["Sol", "Centaur
         dict: {team_name: ResourceStats}
     """
     stats = {team: ResourceStats(team) for team in teams}
-    
+
+    # Group events by team, sorted by time
+    events_by_team = {team: [] for team in teams}
     for event in sorted(resource_status_events, key=lambda e: e.time):
-        if event.team in stats:
-            stats[event.team].record_status(event.time, event.collected, event.spent)
-    
+        if event.team in events_by_team:
+            events_by_team[event.team].append(event)
+
+    # Normalize to zero-baseline in case service started mid-game (avoids graph starting at 300k)
+    for team, events in events_by_team.items():
+        if not events:
+            continue
+        base_collected = events[0].collected
+        base_spent = events[0].spent
+        for event in events:
+            stats[team].record_status(event.time, event.collected - base_collected, event.spent - base_spent)
+
     return stats
 
 
