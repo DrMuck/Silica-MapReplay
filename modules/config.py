@@ -70,7 +70,7 @@ RESOLUTION_CONFIGS = {
         
         # Table 2 (Achievements)
         "table2_label_font_size": 11,
-        "table2_data_font_size": 9,
+        "table2_data_font_size": 6,
         "table2_line_height": 15,
         "table2_x_data": 110,
         "table2_height": 230,
@@ -144,7 +144,7 @@ RESOLUTION_CONFIGS = {
         
         # Table 2 (Achievements)
         "table2_label_font_size": 16,
-        "table2_data_font_size": 14,
+        "table2_data_font_size": 11,
         "table2_line_height": 22,
         "table2_x_data": 160,
         "table2_height": 330,
@@ -200,30 +200,30 @@ RESOLUTION_CONFIGS = {
         "attack_line_width": 3,
         
         # Graph fonts
-        "graph_font_ax": 16,
-        "graph_font_label": 16,
-        "graph_font_legend": 16,
+        "graph_font_ax": 13,
+        "graph_font_label": 17,
+        "graph_font_legend": 14,
         "graph_height": 320,
         "graph_label_pad_x": 10,      # X-axis label offset from graph
         "graph_label_pad_y": 10,      # Y-axis label offset from graph
-        
+
         # Table 1 (Team Statistics)
         "table1_header_font_size": 16,
-        "table1_data_font_size": 18,
+        "table1_data_font_size": 20,
         "table1_row_height": 48,
-        "table1_header_height": 30,
-        "table1_icon_size": 38,
-        "table1_height": 200,
+        "table1_header_height": 28,
+        "table1_icon_size": 34,
+        "table1_height": 210,
         "table1_x_offset": 0,
-        
+
         # Table 2 (Achievements)
-        "table2_label_font_size": 22,
-        "table2_data_font_size": 18,
-        "table2_line_height": 28,
-        "table2_x_data": 200,
-        "table2_height": 420,
-        "table1_to_table2_gap": 25,
-        "table2_header_spacing": 15,
+        "table2_label_font_size": 18,
+        "table2_data_font_size": 16,
+        "table2_line_height": 29,
+        "table2_x_data": 220,
+        "table2_height": 450,
+        "table1_to_table2_gap": 16,
+        "table2_header_spacing": 16,
         
         # Heatmap
         "kill_heat_radius": 45,
@@ -292,7 +292,7 @@ RESOLUTION_CONFIGS = {
         
         # Table 2 (Achievements)
         "table2_label_font_size": 33,
-        "table2_data_font_size": 27,
+        "table2_data_font_size": 24,
         "table2_line_height": 42,
         "table2_x_data": 300,
         "table2_height": 630,
@@ -337,9 +337,9 @@ KILL_SOLDIER_SCALE = 0.5
 
 # Killbar
 KILLBAR_ENTRY_HEIGHT = 24
-KILLBAR_ICON_SIZE = 20
-KILLBAR_FONT_SIZE = 12
-KILLBAR_MAX_ENTRIES = 43  # Reduced to make room for chat
+KILLBAR_ICON_SIZE = 25
+KILLBAR_FONT_SIZE = 16
+KILLBAR_MAX_ENTRIES = 65
 KILLBAR_ICON_TO_NAME_OFFSET = -8  # Offset between icon and name in killbar
 
 # Chat panel
@@ -355,19 +355,19 @@ ATTACK_LINE_WIDTH = 3
 
 # Graph fonts
 Fontsize_Graphax = 12
-Fontsize_Graphlabel = 14
-Fontsize_Graphlegend = 12
+Fontsize_Graphlabel = 15
+Fontsize_Graphlegend = 14
 STATS_GRAPH_HEIGHT = 320
 GRAPH_LABEL_PAD_X = 10  # X-axis label offset from graph
 GRAPH_LABEL_PAD_Y = 10  # Y-axis label offset from graph
 
 # Table 1
 TABLE1_HEADER_FONT_SIZE = 16
-TABLE1_DATA_FONT_SIZE = 18
+TABLE1_DATA_FONT_SIZE = 20
 TABLE1_ROW_HEIGHT = 48
-TABLE1_HEADER_HEIGHT = 30
-TABLE1_ICON_SIZE = 38
-TABLE1_HEIGHT = 200
+TABLE1_HEADER_HEIGHT = 28
+TABLE1_ICON_SIZE = 34
+TABLE1_HEIGHT = 210
 TABLE1_X_OFFSET = 0
 
 # Table 1 Column Widths (adjust these to change spacing)
@@ -376,12 +376,12 @@ TABLE1_COL_WIDTHS = [55, 55, 55, 85, 85, 85, 45, 85, 90]  # Base widths before s
 
 # Table 2
 TABLE2_LABEL_FONT_SIZE = 22
-TABLE2_DATA_FONT_SIZE = 18
-TABLE2_LINE_HEIGHT = 28
-TABLE2_X_DATA = 200
-TABLE2_HEIGHT = 420
-TABLE1_TO_TABLE2_GAP = 25
-TABLE2_HEADER_SPACING = 15
+TABLE2_DATA_FONT_SIZE = 16
+TABLE2_LINE_HEIGHT = 29
+TABLE2_X_DATA = 220
+TABLE2_HEIGHT = 450
+TABLE1_TO_TABLE2_GAP = 16
+TABLE2_HEADER_SPACING = 16
 
 # Heatmap
 KILL_HEAT_RADIUS = 45

@@ -576,9 +576,10 @@ class LiveGameState:
         self.game_time = 0.0  # Relative game time
         
         # Date tracking (extracted from log)
-        self.log_date = None  # Format: "DD/MM" (for backwards compatibility)
-        self.full_date = None  # Format: "YYYY-MM-DD" (for Discord)
-        self.game_datetime = None  # Format: "YYYY/MM/DD - HH:MM" (for display and filename)
+        self.log_date = None       # Format: "DD/MM"
+        self.full_date = None      # Format: "YYYY-MM-DD" (for Discord)
+        self.game_datetime = None  # Format: "YYYY/MM/DD - HH:MM"
+        self.start_time_str = None # Format: "HH:MM" (match start time for overlay)
         
         # Data structures (same as offline parser)
         self.buildings = {}
@@ -628,7 +629,10 @@ class LiveLogParser:
         # Time tracking for midnight rollover
         self.last_raw_time: Optional[float] = None
         self.time_offset = 0
-        
+
+        # Buffer commander events that arrive before game start is detected
+        self._pending_commanders: dict = {}
+
         # Compile regex patterns once
         self._compile_patterns()
     
@@ -688,6 +692,19 @@ class LiveLogParser:
         self.re_commander = re.compile(
             r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>" '
             r'changed role to "Commander"'
+        )
+        # Commander resign: changed role to anything except Commander
+        self.re_role_change = re.compile(
+            r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>" '
+            r'changed role to "(?!Commander)(?P<role>[^"]+)"'
+        )
+        # Player disconnect
+        self.re_disconnect = re.compile(
+            r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>" disconnected'
+        )
+        # Player joins (or switches to) a team — clears commander if they were on another team
+        self.re_team_join = re.compile(
+            r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<old_team>[^">]*)>" joined team "(?P<new_team>[^"]+)"'
         )
         self.re_tech_change = re.compile(
             r'Team "(?P<team>[^"]+)" triggered "technology_change" \(tier "(?P<tier>\d+)"\)'
@@ -832,6 +849,7 @@ class LiveLogParser:
                     self.current_game.is_ended = True
                     self.current_game.game_time = self.current_game.get_relative_time(t_abs)
                     self.completed_games.append(self.current_game)
+                    self._pending_commanders.clear()  # Reset buffer for new map
                     return "game_end"
             
             if self.current_game and self.current_game.map_name == "Unknown":
@@ -901,15 +919,33 @@ class LiveLogParser:
             if datetime_info:
                 date_str, time_str = datetime_info
                 self.current_game.game_datetime = f"{date_str} - {time_str}"
+                self.current_game.start_time_str = time_str  # "HH:MM" for overlay
                 # Also store components for filename
                 self.current_game.game_date_for_filename = date_str.replace("/", "-")  # YYYY-MM-DD
                 self.current_game.game_time_for_filename = time_str.replace(":", "")   # HHMM
 
+            # Copy any buffered pre-game commander events (with relative times)
+            for team, events in self._pending_commanders.items():
+                for t_cmd_abs, player_name in events:
+                    t_rel = self.current_game.get_relative_time(t_cmd_abs)
+                    if team not in self.current_game.commanders:
+                        self.current_game.commanders[team] = []
+                    self.current_game.commanders[team].append((t_rel, player_name))
+            self._pending_commanders.clear()
+
             self.logger.info(f"=== GAME STARTED === Map: {map_name}, Type: {gametype}, t={t_abs:.1f}s, Date: {self.current_game.game_datetime or log_date}")
             return "game_start"
-        
-        # If no active game, skip event processing
+
+        # If no active game, buffer commander events (they may arrive just before game detection)
         if not self.current_game or self.current_game.is_ended:
+            m_cmd = self.re_commander.search(line)
+            if m_cmd:
+                player_name = m_cmd.group("player_name")
+                team = m_cmd.group("team")
+                if team and team != "Unknown":
+                    if team not in self._pending_commanders:
+                        self._pending_commanders[team] = []
+                    self._pending_commanders[team].append((t_abs, player_name))
             return None
         
         game = self.current_game
@@ -1062,7 +1098,7 @@ class LiveLogParser:
             ))
             event_processed = True
         
-        # Commander change
+        # Commander change (player becomes commander)
         m_cmd = self.re_commander.search(line)
         if m_cmd:
             player_name = m_cmd.group("player_name")
@@ -1072,7 +1108,41 @@ class LiveLogParser:
                     game.commanders[team] = []
                 game.commanders[team].append((t, player_name))
             event_processed = True
-        
+
+        # Commander resign (player changes role away from Commander)
+        if not m_cmd:
+            m_role = self.re_role_change.search(line)
+            if m_role:
+                player_name = m_role.group("player_name")
+                team = m_role.group("team")
+                if team and team != "Unknown" and team in game.commanders:
+                    cmds = game.commanders[team]
+                    if cmds and cmds[-1][1] == player_name and cmds[-1][0] <= t:
+                        game.commanders[team].append((t, None))
+                event_processed = True
+
+        # Player disconnect — clear commander if they were commanding
+        m_disc = self.re_disconnect.search(line)
+        if m_disc:
+            player_name = m_disc.group("player_name")
+            # Check all teams (disconnect may show empty team)
+            for team_key, cmds in game.commanders.items():
+                if cmds and cmds[-1][1] == player_name and cmds[-1][0] <= t:
+                    game.commanders[team_key].append((t, None))
+                    break
+            event_processed = True
+
+        # Player joins a team — if they were commander on their old team, clear it
+        m_join = self.re_team_join.search(line)
+        if m_join:
+            player_name = m_join.group("player_name")
+            old_team    = m_join.group("old_team")
+            if old_team and old_team != "Unknown" and old_team in game.commanders:
+                cmds = game.commanders[old_team]
+                if cmds and cmds[-1][1] == player_name and cmds[-1][0] <= t:
+                    game.commanders[old_team].append((t, None))
+            event_processed = True
+
         # Tech change
         m_tech = self.re_tech_change.search(line)
         if m_tech:
@@ -1212,6 +1282,7 @@ class LiveFrameGenerator:
         # SRPL live reader for unit positions
         self.srpl_reader: Optional[LiveSrplReader] = None
         self.srpl_dir = str(Path(__file__).parent.parent / "Mods" / "ReplayLogs")
+        self._last_srpl_tick = -1  # Last SRPL tick for which frames were generated
     
     def start_game(self, game: LiveGameState):
         """Initialize frame generation for a new game."""
@@ -1220,6 +1291,7 @@ class LiveFrameGenerator:
         self.all_output_paths = []
         self.frames_since_size_check = 0
         self.last_frame_rgb = None  # Reset last frame
+        self._last_srpl_tick = -1  # Reset SRPL tick counter
         
         # Clear render cache from previous game (fixes killbar memory leak)
         try:
@@ -1389,16 +1461,16 @@ class LiveFrameGenerator:
                 quality=None,  # Disable quality mode, use bitrate instead
                 macro_block_size=16,  # Force standard macroblock alignment
                 output_params=[
-                    '-b:v', f'{bitrate}k',        # Target bitrate from config
-                    '-maxrate', f'{int(bitrate * 1.5)}k',  # Allow 50% burst for quality
-                    '-bufsize', f'{bitrate}k',    # Full bitrate buffer for consistent quality
-                    '-preset', preset,            # Encoding preset from config
-                    '-tune', 'animation',         # Better for game graphics (consistent quality)
-                    '-pix_fmt', 'yuv420p',        # Standard format
-                    '-movflags', '+faststart',    # Better streaming
-                    '-threads', '2',              # 2 threads (balance of speed/memory)
-                    '-bf', '0',                   # No B-frames = consistent frame quality
-                    '-g', '90',                   # Keyframe every 2 seconds (90 frames at 45fps)
+                    '-b:v', f'{bitrate}k',              # Target bitrate from config
+                    '-maxrate', f'{int(bitrate * 1.5)}k', # Allow 50% burst for complex frames
+                    '-bufsize', f'{bitrate}k',           # Full bitrate buffer for quality peaks
+                    '-preset', preset,                   # Encoding preset from config
+                    '-tune', 'animation',                # Better for game graphics
+                    '-pix_fmt', 'yuv420p',               # Standard format
+                    '-movflags', '+faststart',           # Better streaming
+                    '-threads', '2',                     # 2 threads (balance of speed/memory)
+                    '-bf', '0',                          # No B-frames
+                    '-g', '90',                          # Keyframe every 3s at 30fps
                 ]
             )
             self.all_output_paths.append(self.output_path)
@@ -1469,7 +1541,7 @@ class LiveFrameGenerator:
         }
         return mapping.get(gametype, "Game")
     
-    def generate_frames_up_to(self, game_time: float):
+    def generate_frames_up_to(self, game_time: float, skip_srpl_refresh: bool = False):
         """Generate all frames from last generated to current game time."""
         if not self.current_game or not self.video_writer:
             return
@@ -1521,7 +1593,10 @@ class LiveFrameGenerator:
             # Retry finding SRPL file (may not have existed at game start)
             self._open_srpl_for_game(game)
         if self.srpl_reader:
-            new_records = self.srpl_reader.refresh()
+            if not skip_srpl_refresh:
+                new_records = self.srpl_reader.refresh()
+            else:
+                new_records = 0
             if new_records > 0:
                 self.logger.debug(f"SRPL: read {new_records} new records")
             srpl_replay = self.srpl_reader.replay
@@ -1550,6 +1625,7 @@ class LiveFrameGenerator:
                 # Compute SRPL unit positions and dying units for this frame
                 srpl_units = None
                 dying_eids = None
+                current_srpl_tick = None
                 if srpl_replay and srpl_replay.ticks:
                     destroyed = srpl_replay.get_destroyed_before(t)
                     all_pos = srpl_replay.get_positions_at_time(t)
@@ -1584,7 +1660,8 @@ class LiveFrameGenerator:
                     t_end=end_t,
                     total_frames=0,
                     map_name=game.map_name,
-                    log_date=game.game_datetime or game.log_date,  # Pass full datetime if available
+                    log_date=game.log_date,
+                    start_time=game.start_time_str,  # "HH:MM" match start time
                     chat_messages=game.chat_messages,  # Pass chat messages for chat panel
                     resource_stats=resource_stats,
                     unit_positions=srpl_units,
@@ -1897,26 +1974,40 @@ class MapReplayService:
                 elif result == "event":
                     game = self.parser.current_game
                     if game:
-                        # Start frame generator if not started
+                        # Start frame generator if not started (log data required for map name)
                         if not self.frame_generator.current_game:
                             if game.map_name != "Unknown":
                                 self.frame_generator.start_game(game)
-                        
-                        # Generate frames periodically (every 5 game-seconds)
-                        time_since_last_frame = game.game_time - game.last_frame_time
-                        if time_since_last_frame >= self.config.FRAME_STEP * 5:
-                            self.logger.debug(f"Generating frames: game_time={game.game_time:.1f}s, last_frame={game.last_frame_time:.1f}s")
-                            self.frame_generator.generate_frames_up_to(game.game_time)
-            
-            # Also generate frames if game is active but we haven't in a while
-            # (This handles slow periods with few events)
-            if self.parser.current_game and not self.parser.current_game.is_ended:
-                game = self.parser.current_game
-                if self.frame_generator.current_game:
-                    time_since_last_frame = game.game_time - game.last_frame_time
-                    if time_since_last_frame >= self.config.FRAME_STEP * 10:  # Catch-up if behind
-                        self.logger.debug(f"Catch-up frame generation: {time_since_last_frame:.1f}s behind")
-                        self.frame_generator.generate_frames_up_to(game.game_time)
+                        # Note: frame generation is now driven by SRPL ticks below,
+                        # not by log events. Log events only update game data.
+
+            # SRPL-tick-driven frame generation:
+            # Poll SRPL for new ticks and generate frames on the SRPL clock,
+            # independent of log event arrival rate.
+            game = self.parser.current_game
+            if game and not game.is_ended and self.frame_generator.current_game:
+                fg = self.frame_generator
+                # Try to open SRPL reader if not yet available
+                if not fg.srpl_reader:
+                    fg._open_srpl_for_game(game)
+                if fg.srpl_reader:
+                    new_records = fg.srpl_reader.refresh()
+                    if new_records > 0:
+                        self.logger.debug(f"SRPL: read {new_records} new records")
+                    replay = fg.srpl_reader.replay
+                    if replay.tick_numbers:
+                        max_tick = replay.tick_numbers[-1]
+                        if max_tick > fg._last_srpl_tick:
+                            # Convert SRPL tick to log-relative time
+                            srpl_time = replay.tick_to_seconds(max_tick)
+                            log_time = srpl_time - replay.time_offset
+                            if log_time > 0 and log_time > game.last_frame_time:
+                                self.logger.debug(
+                                    f"SRPL tick {max_tick} → log_time={log_time:.1f}s, "
+                                    f"generating frames from {game.last_frame_time:.1f}s"
+                                )
+                                fg.generate_frames_up_to(log_time, skip_srpl_refresh=True)
+                            fg._last_srpl_tick = max_tick
             
             # Check for game timeout (no events for a while)
             # Skip if timeout-based ending is disabled (for emulator testing)

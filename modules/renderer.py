@@ -38,8 +38,9 @@ from config import (
 # config.KILL_NUMBER_FONT_SIZE, config.KILL_NUMBER_OFFSET_Y, config.ATTACK_LINE_WIDTH
 # TABLE1_*, TABLE2_*, Fontsize_Graph*
 
-from icon_config import get_icon, get_resource_icon, normalize_unit_name, is_soldier, is_ai_unit
+from icon_config import get_icon, get_icon_np, get_resource_icon, normalize_unit_name, is_soldier, is_ai_unit
 from log_parser import world_to_pixel
+from asset_loader import get_asset_pack
 
 
 # Helper to get resolution-dependent values
@@ -836,8 +837,66 @@ def get_render_cache():
     return _render_cache
 
 def clear_render_cache():
-    """Clear the render cache (call between games)."""
+    """Clear the render cache and unit overlay (call between games)."""
     _render_cache.clear()
+    reset_unit_overlay()
+
+
+# ============================================================
+# PERSISTENT UNIT OVERLAY (incremental update)
+# ============================================================
+# Reused numpy array — only dirty regions are cleared/redrawn.
+# Avoids full 8MB np.zeros() each frame and skips unchanged units.
+_uov = {
+    'np':            None,  # numpy array (map_h, map_w, 4)
+    'shape':         None,  # (map_h, map_w) — reset on resize
+    'regions':       {},    # eid -> (fx0, fy0, fx1, fy1)  icon region
+    'states':        {},    # eid -> (ix, iy, status)
+    'label_regions': {},    # eid -> (fx0, fy0, fx1, fy1)  label region
+    'label_states':  {},    # eid -> (lx, ly)               label anchor in overlay
+}
+
+# Cache pre-rendered player label RGBA arrays to avoid re-rendering per frame.
+# Key: (player_name, team_name)
+_label_np_cache: dict = {}
+
+
+def _render_label_np(pname: str, team: str) -> np.ndarray:
+    """Pre-render a player name label (with outline) to an RGBA numpy array."""
+    key = (pname, team)
+    cached = _label_np_cache.get(key)
+    if cached is not None:
+        return cached
+    name_font = get_cached_font(config.KILL_NUMBER_FONT_SIZE)
+    bbox = name_font.getbbox(pname)
+    # bbox = (left, top, right, bottom) — top is often negative (ascenders above baseline)
+    # Draw offset: anchor text top-left at (pad, pad) by compensating for bbox origin
+    dx = pad = 2
+    dy = pad - bbox[1]   # shifts text down so top of tallest glyph sits at y=pad
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    lw = tw + pad * 2
+    lh = th + pad * 2
+    limg = Image.new('RGBA', (lw, lh), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(limg)
+    for ox, oy in ((-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)):
+        ld.text((dx + ox, dy + oy), pname, font=name_font, fill=(0, 0, 0, 220))
+    team_col = TEAM_COLORS.get(team, (255, 255, 255))
+    ld.text((dx, dy), pname, font=name_font,
+            fill=(team_col[0], team_col[1], team_col[2], 255))
+    arr = np.array(limg)
+    _label_np_cache[key] = arr
+    return arr
+
+
+def reset_unit_overlay():
+    """Call when starting a new game to clear the persistent unit overlay."""
+    _uov['np'] = None
+    _uov['regions'].clear()
+    _uov['states'].clear()
+    _uov['label_regions'].clear()
+    _uov['label_states'].clear()
+    _label_np_cache.clear()
 
 
 
@@ -2022,19 +2081,19 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
         """Get the current commander for this team at current_time."""
         if team_name not in commanders or not commanders[team_name]:
             return "N/A"
-        
+
         # Find the most recent commander change before or at current_time
+        # None entries mean no commander (resigned/disconnected)
         team_commanders = commanders[team_name]
         current_commander = None
-        
+
         for time, player_name in team_commanders:
             if time <= current_time:
-                current_commander = player_name
+                current_commander = player_name  # may be None (resigned)
             else:
                 break  # Commanders are in chronological order
-        
+
         if current_commander:
-            # Clip name to 10 characters
             if len(current_commander) > 10:
                 return current_commander[:8] + ".."
             return current_commander
@@ -2070,35 +2129,35 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
         
         x_pos = x_start
         
-        # Team logo
-        logo_path = os.path.join(config.ICON_DIR, team_logos.get(team_name))
-        if os.path.exists(logo_path):
-            try:
-                logo = Image.open(logo_path).convert("RGBA")
-                logo = logo.resize((icon_size, icon_size), Image.BICUBIC)
-                
-                # Tint logo with team color
-                logo_arr = np.array(logo)
-                team_color = GRAPH_COLORS.get(team_name, (255, 255, 255))
-                
-                # Apply team color to white/light pixels
-                r = logo_arr[..., 0]
-                g = logo_arr[..., 1]
-                b = logo_arr[..., 2]
-                a = logo_arr[..., 3]
-                
-                # Mask for bright pixels (logo areas)
-                avg_brightness = (r.astype(np.float32) + g.astype(np.float32) + b.astype(np.float32)) / 3.0
-                bright_mask = (avg_brightness > 100) & (a > 0)
-                
-                logo_arr[..., 0][bright_mask] = team_color[0]
-                logo_arr[..., 1][bright_mask] = team_color[1]
-                logo_arr[..., 2][bright_mask] = team_color[2]
-                
-                logo = Image.fromarray(logo_arr, mode="RGBA")
-                img.alpha_composite(logo, (x_pos, y_pos))
-            except Exception as e:
-                logging.warning(f"Could not load logo for {team_name}: {e}")
+        # Team logo (load from asset pack)
+        try:
+            pack = get_asset_pack()
+            logo_asset = f"Silica_Icons/{team_logos.get(team_name)}"
+            logo = pack.load_image(logo_asset).convert("RGBA")
+            logo = logo.resize((icon_size, icon_size), Image.BICUBIC)
+
+            # Tint logo with team color
+            logo_arr = np.array(logo)
+            team_color = GRAPH_COLORS.get(team_name, (255, 255, 255))
+
+            # Apply team color to white/light pixels
+            r = logo_arr[..., 0]
+            g = logo_arr[..., 1]
+            b = logo_arr[..., 2]
+            a = logo_arr[..., 3]
+
+            # Mask for bright pixels (logo areas)
+            avg_brightness = (r.astype(np.float32) + g.astype(np.float32) + b.astype(np.float32)) / 3.0
+            bright_mask = (avg_brightness > 100) & (a > 0)
+
+            logo_arr[..., 0][bright_mask] = team_color[0]
+            logo_arr[..., 1][bright_mask] = team_color[1]
+            logo_arr[..., 2][bright_mask] = team_color[2]
+
+            logo = Image.fromarray(logo_arr, mode="RGBA")
+            img.alpha_composite(logo, (x_pos, y_pos))
+        except Exception as e:
+            logging.warning(f"Could not load logo for {team_name}: {e}")
         
         x_pos += icon_size + 10
         
@@ -2215,22 +2274,9 @@ def create_table2_playerboard(player_stats, unit_kill_stats, current_time, width
     # But ensure we have room for " -> X (Nx)" suffix
     max_name_len = min(TABLE2_MAX_NAME_LENGTH, 10)
     
-    # Add Silica Logo and "Achievements" header
-    logo_path = os.path.join(config.ICON_DIR, "Silica_Logo.png")
+    # "Achievements" header
     header_height = int(40 * config.get_scale_ratio())
-    logo_size = int(32 * config.get_scale_ratio())
-    if os.path.exists(logo_path):
-        try:
-            logo = Image.open(logo_path).convert("RGBA")
-            logo = logo.resize((logo_size, logo_size), Image.BICUBIC)
-            img.alpha_composite(logo, (x_label, y_pos))
-            # Draw "Achievements" text next to logo
-            draw.text((x_label + logo_size + 10, y_pos + 5), "Achievements", font=font_header, fill=(255, 255, 255, 255))
-        except Exception as e:
-            # Fallback: just draw text
-            draw.text((x_label, y_pos + 5), "Achievements", font=font_header, fill=(255, 255, 255, 255))
-    else:
-        draw.text((x_label, y_pos + 5), "Achievements", font=font_header, fill=(255, 255, 255, 255))
+    draw.text((x_label, y_pos + 5), "Achievements", font=font_header, fill=(255, 255, 255, 255))
     
     y_pos += header_height + config.TABLE2_HEADER_SPACING  # Extra spacing after header
     
@@ -2573,7 +2619,7 @@ def render_stats_panel(kill_stats, building_stats, player_stats, unit_kill_stats
 
 
 
-def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, chat_messages=None, resource_stats=None, unit_positions=None, dying_units=None):
+def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, start_time=None, chat_messages=None, resource_stats=None, unit_positions=None, dying_units=None):
     """
     Render one frame at game time t (seconds).
     Layout: [MAP | KILLBAR | STATS PANEL]
@@ -2708,67 +2754,163 @@ def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_
 
     t_start_time = record_time('buildings', t_start_time)
 
-    # --- Unit Positions (from .srpl data) ---
+    # --- Unit Positions (from .srpl data) — incremental overlay ---
     if unit_positions:
-        dying_set = set(dying_units or [])
-        # Only render units (buildings already rendered from log data)
-        units_only = [up for up in unit_positions if up.get("is_unit", True)]
-        for up in units_only:
-            team = up.get("team_name", "")
-            type_name = up.get("type_name", "")
-            x_px, y_px = world_to_pixel(up["x"], up["y"], map_w, map_h, world_extent)
-            is_player = up.get("controller_name") is not None
-            eid = up.get("entity_id")
-            is_dying = eid in dying_set
+        import time as _time
+        _t0 = _time.perf_counter()
 
-            # Convert display name to ICON_MAP key (remove spaces, handle special cases)
+        dying_set = set(dying_units or [])
+        units_only = [up for up in unit_positions if up.get("is_unit", True)]
+
+        ov = _uov
+        # Re-init overlay if resolution changed or new game (reset_unit_overlay called)
+        if ov['np'] is None or ov['shape'] != (map_h, map_w):
+            ov['np'] = np.zeros((map_h, map_w, 4), dtype=np.uint8)
+            ov['shape'] = (map_h, map_w)
+            ov['regions'].clear()
+            ov['states'].clear()
+        overlay_np = ov['np']
+
+        _t_setup = _time.perf_counter()
+
+        # Incremental update: diff current positions vs cached, redraw only changed units
+        current_ids = set()
+        _t_icon_fetch = 0.0
+        _t_np_write = 0.0
+        _n_changed = 0
+        _n_skipped = 0
+
+        for up in units_only:
+            eid = up.get("entity_id")
+            current_ids.add(eid)
+            x_px, y_px = world_to_pixel(up["x"], up["y"], map_w, map_h, world_extent)
+            ix, iy = int(x_px + 0.5), int(y_px + 0.5)
+            is_player = up.get("controller_name") is not None
+            is_dying = eid in dying_set
+            team = up.get("team_name", "")
+
+            if is_dying:
+                status = "flash"
+            elif is_player:
+                status = "complete"
+            else:
+                status = "ai"
+
+            # Skip if unit hasn't moved and status unchanged (icon + label already in overlay)
+            if ov['states'].get(eid) == (ix, iy, status):
+                _n_skipped += 1
+                continue
+
+            _n_changed += 1
+
+            # Clear old icon region for this unit
+            if eid in ov['regions']:
+                ox0, oy0, ox1, oy1 = ov['regions'][eid]
+                overlay_np[oy0:oy1, ox0:ox1] = 0
+
+            # Clear old label region for this unit
+            if eid in ov['label_regions']:
+                lx0, ly0, lx1, ly1 = ov['label_regions'].pop(eid)
+                overlay_np[ly0:ly1, lx0:lx1] = 0
+                ov['label_states'].pop(eid, None)
+
+            # Compute icon
+            type_name = up.get("type_name", "")
             icon_key = type_name.replace(" ", "")
             if icon_key == "HornedCrab":
                 icon_key = "CrabHorned"
+            unit_scale = config.ICON_SCALE * (
+                config.KILL_SOLDIER_SCALE if is_soldier(icon_key) else config.KILL_ICON_SCALE
+            )
+            _ti0 = _time.perf_counter()
+            icon_arr = get_icon_np(icon_key, team, status, unit_scale)
+            _t_icon_fetch += _time.perf_counter() - _ti0
 
-            # Scale units like kill icons in the base mod: soldiers smaller, vehicles/structures larger
-            if is_soldier(icon_key):
-                unit_scale = config.ICON_SCALE * config.KILL_SOLDIER_SCALE
-            else:
-                unit_scale = config.ICON_SCALE * config.KILL_ICON_SCALE
-
-            # Dying units: flash white
-            if is_dying:
-                icon = get_icon(icon_key, team, "flash", unit_scale)
-            else:
-                icon = get_icon(icon_key, team, "complete", unit_scale)
-
-            if icon is not None:
-                # AI units: very slightly transparent
-                if not is_player and not is_dying:
-                    icon = icon.copy()
-                    alpha_band = icon.split()[3]
-                    alpha_band = alpha_band.point(lambda a: int(a * 0.88))
-                    icon.putalpha(alpha_band)
-                iw, ih = icon.size
-                frame.alpha_composite(icon, (int(x_px - iw / 2), int(y_px - ih / 2)))
-
-                # Player name label above the icon
-                if is_player:
-                    pname = up["controller_name"]
-                    name_font = get_cached_font(config.KILL_NUMBER_FONT_SIZE)
-                    bbox = name_font.getbbox(pname)
-                    tw = bbox[2] - bbox[0]
-                    th = bbox[3] - bbox[1]
-                    nx = int(x_px - tw / 2)
-                    ny = int(y_px - ih / 2 - th - 2)
-                    # Dark outline for readability
-                    for ox, oy in ((-1,-1),(-1,1),(1,-1),(1,1),(0,-1),(0,1),(-1,0),(1,0)):
-                        draw.text((nx+ox, ny+oy), pname, font=name_font, fill=(0, 0, 0, 220))
-                    team_col = TEAM_COLORS.get(team, (255, 255, 255))
-                    draw.text((nx, ny), pname, font=name_font, fill=(team_col[0], team_col[1], team_col[2], 255))
-            else:
-                # Fallback: colored dot (white if dying)
+            if icon_arr is None:
+                # Fallback dot via PIL — no overlay cache entry
+                ov['regions'].pop(eid, None)
+                ov['states'].pop(eid, None)
                 col = (255, 255, 255) if is_dying else TEAM_COLORS.get(team, (200, 200, 200))
                 r = 3 if is_player else 2
-                alpha = 255 if is_dying else (200 if is_player else 100)
-                draw.ellipse((x_px - r, y_px - r, x_px + r, y_px + r),
-                             fill=(col[0], col[1], col[2], alpha))
+                alpha_v = 255 if is_dying else (200 if is_player else 100)
+                draw.ellipse((ix - r, iy - r, ix + r, iy + r),
+                             fill=(col[0], col[1], col[2], alpha_v))
+                continue
+
+            ih, iw = icon_arr.shape[:2]
+            x0 = ix - iw // 2
+            y0 = iy - ih // 2
+            x1 = x0 + iw
+            y1 = y0 + ih
+            sx0 = max(0, -x0);  sy0 = max(0, -y0)
+            fx0 = max(0, x0);   fy0 = max(0, y0)
+            fx1 = min(x1, map_w); fy1 = min(y1, map_h)
+
+            if fx0 >= fx1 or fy0 >= fy1:
+                ov['regions'].pop(eid, None)
+                ov['states'].pop(eid, None)
+                continue
+
+            w = fx1 - fx0
+            h = fy1 - fy0
+            _tnp0 = _time.perf_counter()
+            overlay_np[fy0:fy1, fx0:fx1] = icon_arr[sy0:sy0 + h, sx0:sx0 + w]
+            _t_np_write += _time.perf_counter() - _tnp0
+            ov['regions'][eid] = (fx0, fy0, fx1, fy1)
+            ov['states'][eid] = (ix, iy, status)
+
+            # Write player name label into the overlay (persistent, only redrawn on move)
+            if is_player:
+                pname = up["controller_name"]
+                label_arr = _render_label_np(pname, team)
+                lh, lw = label_arr.shape[:2]
+                lx = ix - lw // 2
+                ly = iy - ih // 2 - lh - 2
+                lx0c = max(0, lx);   ly0c = max(0, ly)
+                lx1c = min(lx + lw, map_w); ly1c = min(ly + lh, map_h)
+                if lx0c < lx1c and ly0c < ly1c:
+                    slx = lx0c - lx;  sly = ly0c - ly
+                    _tnp0 = _time.perf_counter()
+                    lw_c = lx1c - lx0c; lh_c = ly1c - ly0c
+                    # Alpha-blend label onto overlay (label may overlap other content)
+                    dst = overlay_np[ly0c:ly1c, lx0c:lx1c]
+                    src = label_arr[sly:sly + lh_c, slx:slx + lw_c]
+                    src_a = src[:, :, 3:4].astype(np.float32) / 255.0
+                    dst[:] = (src[:, :, :4] * src_a + dst * (1.0 - src_a)).astype(np.uint8)
+                    _t_np_write += _time.perf_counter() - _tnp0
+                    ov['label_regions'][eid] = (lx0c, ly0c, lx1c, ly1c)
+                    ov['label_states'][eid]  = (lx, ly)
+
+        _t_loop = _time.perf_counter()
+
+        # Clear icon+label regions for units that disappeared this frame
+        disappeared = set(ov['regions']) - current_ids
+        for eid in disappeared:
+            ox0, oy0, ox1, oy1 = ov['regions'].pop(eid)
+            overlay_np[oy0:oy1, ox0:ox1] = 0
+            ov['states'].pop(eid, None)
+            if eid in ov['label_regions']:
+                lx0, ly0, lx1, ly1 = ov['label_regions'].pop(eid)
+                overlay_np[ly0:ly1, lx0:lx1] = 0
+                ov['label_states'].pop(eid, None)
+
+        # Single composite: persistent overlay onto frame
+        frame.alpha_composite(Image.fromarray(overlay_np, 'RGBA'), dest=(0, 0))
+
+        _t_composite = _time.perf_counter()
+        _t_labels = _t_composite  # labels now in overlay, no separate phase
+
+        # Sub-timing breakdown into timing_detail
+        if timing_detail is not None:
+            timing_detail['upos_setup']     = timing_detail.get('upos_setup', 0)     + (_t_setup     - _t0)
+            timing_detail['upos_loop']      = timing_detail.get('upos_loop', 0)      + (_t_loop      - _t_setup)
+            timing_detail['upos_icon_fetch']= timing_detail.get('upos_icon_fetch', 0)+ _t_icon_fetch
+            timing_detail['upos_np_write']  = timing_detail.get('upos_np_write', 0)  + _t_np_write
+            timing_detail['upos_composite'] = timing_detail.get('upos_composite', 0) + (_t_composite - _t_loop)
+            timing_detail['upos_labels']    = timing_detail.get('upos_labels', 0)    + (_t_labels    - _t_composite)
+            timing_detail['upos_n_units']   = timing_detail.get('upos_n_units', 0)   + len(units_only)
+            timing_detail['upos_n_changed'] = timing_detail.get('upos_n_changed', 0) + _n_changed
+            timing_detail['upos_n_skipped'] = timing_detail.get('upos_n_skipped', 0) + _n_skipped
 
     t_start_time = record_time('unit_positions', t_start_time)
 
@@ -2875,29 +3017,28 @@ def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_
                    fill=(0, 0, 0, 120))
     draw.text((x_text, y_text), time_str, font=font, fill=text_color)
 
-    # --- Map info overlay (for cleanlog) - top-left ---
-    if map_name or log_date:
+    # --- Map info overlay - top-left: "DD/MM  MapName  HH:MM" ---
+    if map_name or log_date or start_time:
         map_info_font = load_font(getattr(config, 'MAP_INFO_FONT_SIZE', 20))
         map_info_margin = getattr(config, 'MAP_INFO_MARGIN', 10)
-        
-        # Build info text: "DD/MM - MapName" or just what's available
+
         info_parts = []
         if log_date:
             info_parts.append(log_date)
         if map_name:
             info_parts.append(map_name)
-        info_text = " - ".join(info_parts) if info_parts else ""
-        
+        if start_time:
+            info_parts.append(start_time)
+        info_text = "  |  ".join(info_parts) if info_parts else ""
+
         if info_text:
             bbox = draw.textbbox((0, 0), info_text, font=map_info_font)
             info_tw = bbox[2] - bbox[0]
             info_th = bbox[3] - bbox[1]
-            
-            # Position: top-left with margin
+
             info_x = map_info_margin
             info_y = map_info_margin
-            
-            # Background box
+
             draw.rectangle((info_x - config.CLOCK_BOX_MARGIN, info_y - config.CLOCK_BOX_MARGIN,
                            info_x + info_tw + config.CLOCK_BOX_MARGIN, info_y + info_th + config.CLOCK_BOX_MARGIN),
                            fill=(0, 0, 0, 120))

@@ -82,8 +82,8 @@ MAX_PENDING_FRAMES = 500
 
 # Video encoding bitrate (kbps)
 # Lower = smaller files, less RAM, but lower quality
-# Recommended: 1500-2500 for 1440p, 1000-1500 for 1080p
-VIDEO_BITRATE_KBPS = 1900
+# Recommended: 1200-1800 for 1440p, 800-1200 for 1080p
+VIDEO_BITRATE_KBPS = 2200  # Average target; encoder can burst up to 1.5x for complex frames
 
 # FFmpeg encoding preset
 # Options: "ultrafast", "superfast", "veryfast", "faster", "fast", "medium"

@@ -24,6 +24,7 @@ except ImportError:
 # Icon caches
 _icon_base_cache = {}
 _icon_tinted_cache = {}
+_icon_np_cache = {}  # same key -> numpy uint8 RGBA array, for fast batch compositing
 MISSING_ICON_TYPES = set()
 _icons_preloaded = False
 
@@ -495,10 +496,23 @@ def tint_icon(base_icon, team, status):
 def get_icon(unit_name: str, team: str, status: str, scale: float):
     """
     Return a tinted & scaled icon for a unit/team/status.
-    status: 'construction', 'complete', 'flash'
+    status: 'construction', 'complete', 'flash', 'ai'
+      'ai' = same as 'complete' but pre-dimmed to 88% alpha (for non-player AI units).
+             Cached like all other variants — computed once, reused every frame.
     """
     cache_key = (unit_name, team, status, scale)
     if cache_key in _icon_tinted_cache:
+        return _icon_tinted_cache[cache_key]
+
+    if status == "ai":
+        # Derive from the cached "complete" variant, dim alpha to 88%
+        complete = get_icon(unit_name, team, "complete", scale)
+        if complete is None:
+            _icon_tinted_cache[cache_key] = None
+            return None
+        arr = np.array(complete, dtype=np.uint8).copy()
+        arr[..., 3] = (arr[..., 3].astype(np.float32) * 0.88).astype(np.uint8)
+        _icon_tinted_cache[cache_key] = Image.fromarray(arr, mode="RGBA")
         return _icon_tinted_cache[cache_key]
 
     base = load_base_icon(unit_name)
@@ -514,6 +528,20 @@ def get_icon(unit_name: str, team: str, status: str, scale: float):
 
     _icon_tinted_cache[cache_key] = tinted
     return tinted
+
+
+def get_icon_np(unit_name: str, team: str, status: str, scale: float):
+    """
+    Return icon as a cached numpy uint8 RGBA array.
+    Used by the batch numpy compositing path in renderer — avoids PIL overhead per unit per frame.
+    """
+    cache_key = (unit_name, team, status, scale)
+    if cache_key in _icon_np_cache:
+        return _icon_np_cache[cache_key]
+    img = get_icon(unit_name, team, status, scale)
+    arr = np.array(img, dtype=np.uint8) if img is not None else None
+    _icon_np_cache[cache_key] = arr
+    return arr
 
 
 def get_resource_icon(icon_name: str, color: tuple, status: str, scale: float):
