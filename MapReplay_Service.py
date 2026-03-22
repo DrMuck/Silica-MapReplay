@@ -1281,7 +1281,7 @@ class LiveFrameGenerator:
 
         # SRPL live reader for unit positions
         self.srpl_reader: Optional[LiveSrplReader] = None
-        self.srpl_dir = str(Path(__file__).parent.parent / "Mods" / "ReplayLogs")
+        self.srpl_dir = str(Path(__file__).parent.parent / "UserData" / "ReplayLogs")
         self._last_srpl_tick = -1  # Last SRPL tick for which frames were generated
     
     def start_game(self, game: LiveGameState):
@@ -1445,8 +1445,11 @@ class LiveFrameGenerator:
             import imageio.v2 as imageio
             
             # Get settings from config (with defaults)
-            bitrate = getattr(self.config, 'VIDEO_BITRATE_KBPS', 1900)
-            preset = getattr(self.config, 'FFMPEG_PRESET', 'veryfast')
+            bitrate  = getattr(self.config, 'VIDEO_BITRATE_KBPS', 1900)
+            maxrate  = getattr(self.config, 'VIDEO_MAXRATE_KBPS', 0)
+            if maxrate <= 0:
+                maxrate = int(bitrate * 1.5)
+            preset   = getattr(self.config, 'FFMPEG_PRESET', 'veryfast')
             
             # FFmpeg parameters balanced for quality and memory
             # Key changes from ultra-low-memory version:
@@ -1462,7 +1465,7 @@ class LiveFrameGenerator:
                 macro_block_size=16,  # Force standard macroblock alignment
                 output_params=[
                     '-b:v', f'{bitrate}k',              # Target bitrate from config
-                    '-maxrate', f'{int(bitrate * 1.5)}k', # Allow 50% burst for complex frames
+                    '-maxrate', f'{maxrate}k',           # Burst cap (VIDEO_MAXRATE_KBPS or 1.5x auto)
                     '-bufsize', f'{bitrate}k',           # Full bitrate buffer for quality peaks
                     '-preset', preset,                   # Encoding preset from config
                     '-tune', 'animation',                # Better for game graphics
@@ -1474,7 +1477,7 @@ class LiveFrameGenerator:
                 ]
             )
             self.all_output_paths.append(self.output_path)
-            self.logger.info(f"Video writer initialized: {self.output_path} (bitrate: {bitrate}k, preset: {preset})")
+            self.logger.info(f"Video writer initialized: {self.output_path} (bitrate: {bitrate}k, maxrate: {maxrate}k, preset: {preset})")
             return True
             
         except Exception as e:
