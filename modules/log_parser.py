@@ -11,7 +11,10 @@ Supports two log formats:
 import re
 from collections import defaultdict
 import logging
-from data_models import Building, KillEvent, DeathEvent, Resource, VictoryInfo, ChatMessage, ResourceStatusEvent
+from data_models import (
+    Building, KillEvent, DeathEvent, Resource, VictoryInfo, ChatMessage, ResourceStatusEvent,
+    KohSpawn, OutpostRing, KohKingChange, KohProgress, KohWin,
+)
 from config import WORLD_EXTENT
 from icon_config import normalize_unit_name, ICON_MAP
 
@@ -126,6 +129,14 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
         'gametype': None,
         'gametype_short': None,
         'start_line': None,
+        # Si_KingOfTheHill (KGT) — populated only when the round was KoH-enabled.
+        'kgt': {
+            'koh_spawn': None,        # KohSpawn namedtuple or None
+            'outpost_ring': None,     # OutpostRing namedtuple or None
+            'king_changes': [],       # list[KohKingChange]
+            'progress_events': [],    # list[KohProgress]
+            'win': None,              # KohWin or None
+        },
     }
 
     tmp = defaultdict(lambda: {
@@ -189,7 +200,18 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
     # Chat message patterns - only player messages (say and say_team)
     re_chat_say = re.compile(r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>" say "(?P<message>.+)"')
     re_chat_say_team = re.compile(r'"(?P<player_name>[^"<]+)<[^>]*><[^>]*><(?P<team>[^">]*)>" say_team "(?P<message>.+)"')
-    
+
+    # Map layout announcement from MapBalance mod (game log + MelonLoader log format)
+    re_map_layout = re.compile(r'World triggered "map_layout" \(layout "(?P<layout>[^"]+)"\)')
+    re_map_layout_melon = re.compile(r'\[Map_Balance\] Allchat: (?P<message>Map Balance: .+)')
+
+    # Si_KingOfTheHill (KGT) events. Lazy-imported namedtuples below.
+    re_kgt_koh_spawn     = re.compile(r'World triggered "kgt_koh_spawn" \(x "(?P<x>-?\d+(?:\.\d+)?)"\) \(z "(?P<z>-?\d+(?:\.\d+)?)"\) \(capture_radius "(?P<cr>\d+(?:\.\d+)?)"\) \(exclusion_radius "(?P<er>\d+(?:\.\d+)?)"\) \(win_threshold "(?P<wt>\d+(?:\.\d+)?)"\)')
+    re_kgt_outpost_ring  = re.compile(r'World triggered "kgt_outpost_ring" \(center_x "(?P<cx>-?\d+(?:\.\d+)?)"\) \(center_z "(?P<cz>-?\d+(?:\.\d+)?)"\) \(radius "(?P<r>\d+(?:\.\d+)?)"\) \(count "(?P<n>\d+)"\) \(bury_depth "(?P<bd>\d+(?:\.\d+)?)"\)')
+    re_kgt_king_change   = re.compile(r'World triggered "kgt_king_change" \(team "(?P<team>[^"]+)"\) \(previous_team "(?P<prev>[^"]+)"\) \(progress_pct "(?P<pct>\d+(?:\.\d+)?)"\)')
+    re_kgt_progress      = re.compile(r'World triggered "kgt_progress" \(team "(?P<team>[^"]+)"\) \(pct "(?P<pct>\d+)"\) \(accumulated "(?P<acc>\d+(?:\.\d+)?)"\) \(threshold "(?P<th>\d+(?:\.\d+)?)"\)')
+    re_kgt_win           = re.compile(r'World triggered "kgt_win" \(winner "(?P<winner>[^"]+)"\)')
+
     # Resource status pattern
     re_resource_status = re.compile(r'Team "(?P<team>[^"]+)" triggered "resource_status" \(collected "(?P<collected>\d+)"\) \(spent "(?P<spent>\d+)"\)')
 
@@ -362,11 +384,26 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
             player_name = m_chat.group("player_name")
             team = m_chat.group("team")
             message = m_chat.group("message")
-            # Only include messages from players with a team (not server or empty team)
             if team and team not in ("", "Unknown"):
+                # Normal player message
                 chat_messages.append(ChatMessage(t, player_name, team, message, False))
+            elif "Map Balance:" in message:
+                # Server message with map layout info — include as system message
+                chat_messages.append(ChatMessage(t, "Server", "System", message, False))
             continue
         
+        # Map layout announcement (game log format from Si_MapBalance)
+        m_layout = re_map_layout.search(line)
+        if m_layout:
+            layout_name = m_layout.group("layout")
+            chat_messages.append(ChatMessage(t, "Server", "System", f"Map Balance: {layout_name}", False))
+            continue
+        # Also check MelonLoader log format (fallback for latestlog mode)
+        m_layout_melon = re_map_layout_melon.search(line)
+        if m_layout_melon:
+            chat_messages.append(ChatMessage(t, "Server", "System", m_layout_melon.group("message"), False))
+            continue
+
         # Tech change
         m_tech = re_tech_change.search(line)
         if m_tech:
@@ -382,6 +419,46 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
             collected = int(m_res_status.group("collected"))
             spent = int(m_res_status.group("spent"))
             resource_status_events.append(ResourceStatusEvent(t, team, collected, spent))
+            continue
+
+        # Si_KingOfTheHill events
+        m_kgt_koh = re_kgt_koh_spawn.search(line)
+        if m_kgt_koh:
+            game_info['kgt']['koh_spawn'] = KohSpawn(
+                t,
+                float(m_kgt_koh.group("x")), float(m_kgt_koh.group("z")),
+                float(m_kgt_koh.group("cr")), float(m_kgt_koh.group("er")),
+                float(m_kgt_koh.group("wt"))
+            )
+            continue
+        m_kgt_ring = re_kgt_outpost_ring.search(line)
+        if m_kgt_ring:
+            game_info['kgt']['outpost_ring'] = OutpostRing(
+                t,
+                float(m_kgt_ring.group("cx")), float(m_kgt_ring.group("cz")),
+                float(m_kgt_ring.group("r")), int(m_kgt_ring.group("n")),
+                float(m_kgt_ring.group("bd"))
+            )
+            continue
+        m_kgt_king = re_kgt_king_change.search(line)
+        if m_kgt_king:
+            game_info['kgt']['king_changes'].append(KohKingChange(
+                t,
+                m_kgt_king.group("team"), m_kgt_king.group("prev"),
+                float(m_kgt_king.group("pct"))
+            ))
+            continue
+        m_kgt_prog = re_kgt_progress.search(line)
+        if m_kgt_prog:
+            game_info['kgt']['progress_events'].append(KohProgress(
+                t,
+                m_kgt_prog.group("team"), int(m_kgt_prog.group("pct")),
+                float(m_kgt_prog.group("acc")), float(m_kgt_prog.group("th"))
+            ))
+            continue
+        m_kgt_win = re_kgt_win.search(line)
+        if m_kgt_win:
+            game_info['kgt']['win'] = KohWin(t, m_kgt_win.group("winner"))
             continue
 
         # Construction

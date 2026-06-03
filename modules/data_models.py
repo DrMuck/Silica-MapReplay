@@ -49,6 +49,39 @@ ResourceStatusEvent = namedtuple(
     ["time", "team", "collected", "spent"]
 )
 
+# === Si_KingOfTheHill (KGT / King of the Galactic Teleport) events ===
+
+# Position + radii of the central capture point. Emitted once per round on KoH spawn.
+KohSpawn = namedtuple(
+    "KohSpawn",
+    ["time", "x", "z", "capture_radius", "exclusion_radius", "win_threshold"]
+)
+
+# Perimeter ring of outposts around the capture zone. Positions are not enumerated
+# individually; derive as `count` points evenly around (center_x, center_z) at `radius`.
+OutpostRing = namedtuple(
+    "OutpostRing",
+    ["time", "center_x", "center_z", "radius", "count", "bury_depth"]
+)
+
+# Ownership change. previous_team == "none" on first capture of the round.
+KohKingChange = namedtuple(
+    "KohKingChange",
+    ["time", "team", "previous_team", "progress_pct"]
+)
+
+# Milestone progress crossing (25 / 50 / 75 / 95 %).
+KohProgress = namedtuple(
+    "KohProgress",
+    ["time", "team", "pct", "accumulated", "threshold"]
+)
+
+# Final win event (separate from the existing Victory line — KGT-specific).
+KohWin = namedtuple(
+    "KohWin",
+    ["time", "winner"]
+)
+
 
 class TeamStats:
     """Track statistics for a single team throughout the match."""
