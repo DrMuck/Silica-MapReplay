@@ -65,8 +65,8 @@ def _clean_killbar_name(name):
     return name
 
 def _filter_kills_for_killbar(kills, current_time):
-    """Filter and clean kills for killbar display (no structure kills)."""
-    past_kills = [k for k in kills if k.time <= current_time and not k.is_structure]
+    """Filter and clean kills for killbar display (includes structure kills)."""
+    past_kills = [k for k in kills if k.time <= current_time]
     return sorted(past_kills, key=lambda k: k.time, reverse=True)
 
 
@@ -741,8 +741,8 @@ class RenderCache:
         self.killbar_shifts = 0  # New: track shift operations
         self.killbar_rebuilds = 0  # New: track full rebuilds
         
-    def get_stats_panel(self, frame_num, kill_stats, building_stats, player_stats, 
-                        unit_kill_stats, commanders, current_time, width, height, update_interval, resource_stats=None):
+    def get_stats_panel(self, frame_num, kill_stats, building_stats, player_stats,
+                        unit_kill_stats, commanders, current_time, width, height, update_interval, resource_stats=None, harvester_stats=None):
         """Get cached or regenerate stats panel."""
         # Check if we need to update
         should_update = (
@@ -750,12 +750,12 @@ class RenderCache:
             frame_num == 0 or
             (frame_num - self.stats_panel_frame) >= update_interval
         )
-        
+
         if should_update:
             self.stats_panel = render_stats_panel_impl(
-                kill_stats, building_stats, player_stats, 
+                kill_stats, building_stats, player_stats,
                 unit_kill_stats, commanders, current_time, width, height,
-                resource_stats=resource_stats
+                resource_stats=resource_stats, harvester_stats=harvester_stats
             )
             self.stats_panel_frame = frame_num
             self.stats_misses += 1
@@ -2044,7 +2044,7 @@ def create_resource_graph_pil(resource_stats, current_time, width, height):
 USE_PIL_GRAPHS = True  # Set to False to use matplotlib (slower but has markers)
 
 
-def create_table1_team_stats(kill_stats, building_stats, player_stats, commanders, current_time, width, height):
+def create_table1_team_stats(kill_stats, building_stats, player_stats, commanders, current_time, width, height, harvester_stats=None):
     """
     Create Table 1: Team Statistics with Icons
     
@@ -2073,7 +2073,8 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
     team_logos = {
         "Sol": "512x512_Sol_Logo-01.png",
         "Centauri": "Centauri_512x512-01-01.png",
-        "Alien": "512x512_alien_logo.png"
+        "Alien": "512x512_alien_logo.png",
+        "Wildlife": "Wildlife_Logo.png",
     }
     
     # Helper function to get current commander from parsed log data
@@ -2101,8 +2102,8 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
     
     # Column headers - NO worm stats (those go on scoreboard only)
     scale = config.get_scale_ratio()
-    headers = ["Units\nLost", "Units\nKilled", "Bldgs\nKilled", "Bldgs\nBuild/Lost", 
-               "Refs/Bio\nBuild/Lost", "HQs/Nest\nBuild/Lost", "Tech\nLevel", "Nodes\nBuild/Lost", "Commander"]
+    headers = ["Units\nLost", "Units\nKilled", "Bldgs\nKilled", "Bldgs\nBuild/Lost",
+               "Harv/Shrp\nBuild/Lost", "HQs/Nest\nBuild/Lost", "Tech\nLevel", "Nodes\nBuild/Lost", "Commander"]
     
     # Get column widths from config (or use defaults)
     base_widths = getattr(config, 'TABLE1_COL_WIDTHS', [55, 55, 55, 85, 85, 85, 45, 85, 90])
@@ -2123,8 +2124,8 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
     y_pos += header_height  # Use smaller header height instead of full row_height
     
     # Draw data rows for each team
-    for team_name in ["Sol", "Centauri", "Alien"]:
-        if team_name not in kill_stats or team_name not in building_stats:
+    for team_name in ["Sol", "Centauri", "Alien", "Wildlife"]:
+        if team_name not in kill_stats:
             continue
         
         x_pos = x_start
@@ -2163,49 +2164,74 @@ def create_table1_team_stats(kill_stats, building_stats, player_stats, commander
         
         # Get kill stats
         kill_stats_tuple = kill_stats[team_name].get_stats_at_time(current_time)
-        
+
         # Handle both old format (4 values) and new format (6 values) for backward compatibility
         if len(kill_stats_tuple) >= 6:
             lost_u, lost_b, killed_u, killed_b, _, _ = kill_stats_tuple[:6]  # Ignore worm stats here
         else:
             lost_u, lost_b, killed_u, killed_b = kill_stats_tuple[:4]
-        
-        # Get building stats
-        (hq_built, hq_current, refs_built, refs_current, bio_built, bio_current,
-         nodes_built, nodes_lost, tech_level, total_built) = \
-            building_stats[team_name].get_stats_at_time(current_time)
 
-
-        
-        # Calculate totalss
-        if team_name == "Alien":
-            resource_build = bio_built
-            resource_lost = bio_built - bio_current
+        if team_name == "Wildlife":
+            # Wildlife builds Nests (no tech, no harvesters, no nodes)
+            commander = get_team_commander(team_name)
+            if team_name in building_stats:
+                (hq_built, hq_current, _refs_built, _refs_current, _bio_built, _bio_current,
+                 _nodes_built, _nodes_lost, _tech_level, total_built) = \
+                    building_stats[team_name].get_stats_at_time(current_time)
+                hq_lost = hq_built - hq_current
+                bldgs_build = total_built
+                bldgs_lost = hq_lost  # Wildlife buildings are Nests
+            else:
+                hq_built = hq_lost = bldgs_build = bldgs_lost = 0
+            data = [
+                str(lost_u),                                    # Units Lost
+                str(killed_u),                                  # Units Killed
+                str(killed_b),                                  # Bldgs Killed
+                f"{bldgs_build}/{bldgs_lost}" if bldgs_build else "-",  # Bldgs Build/Lost
+                "-",                                            # Harv/Shrp Build/Lost
+                f"{hq_built}/{hq_lost}" if hq_built else "-",  # HQs/Nest Build/Lost
+                "-",                                            # Tech Level
+                "-",                                            # Nodes
+                commander,                                      # Commander
+            ]
         else:
-            resource_build = refs_built
-            resource_lost = refs_built - refs_current
-        
-        hq_lost = hq_built - hq_current
+            # Get building stats
+            if team_name in building_stats:
+                (hq_built, hq_current, refs_built, refs_current, bio_built, bio_current,
+                 nodes_built, nodes_lost, tech_level, total_built) = \
+                    building_stats[team_name].get_stats_at_time(current_time)
+            else:
+                hq_built = hq_current = refs_built = refs_current = 0
+                bio_built = bio_current = nodes_built = nodes_lost = 0
+                tech_level = total_built = 0
 
-        # Total buildings built: every structure that ever started construction
-        bldgs_build = total_built
+            # Get harvester/shrimp stats from harvester_stats if available
+            harv_built = harv_lost = 0
+            if harvester_stats and team_name in harvester_stats:
+                h_stats = harvester_stats[team_name]
+                harv_built = h_stats.get("built", 0)
+                harv_lost = h_stats.get("lost", 0)
 
-        
-        # Get current commander for this team
-        commander = get_team_commander(team_name)
-        
-        # Data for this team (NO worm stats - those go on scoreboard)
-        data = [
-            str(lost_u),                                    # Units Lost
-            str(killed_u),                                  # Units Killed
-            str(killed_b),                                  # Bldgs Killed
-            f"{bldgs_build}/{lost_b}",                     # Bldgs Build/Lost
-            f"{resource_build}/{resource_lost}",           # Refs/Bio Build/Lost
-            f"{hq_built}/{hq_lost}",                       # HQs/Nest Build/Lost
-            str(tech_level),                                # Tech Level
-            f"{nodes_built}/{nodes_lost}" if team_name == "Alien" else "-",  # Nodes (Alien only)
-            commander,                                      # Commander
-        ]
+            hq_lost = hq_built - hq_current
+
+            # Total buildings built: every structure that ever started construction
+            bldgs_build = total_built
+
+            # Get current commander for this team
+            commander = get_team_commander(team_name)
+
+            # Data for this team (NO worm stats - those go on scoreboard)
+            data = [
+                str(lost_u),                                    # Units Lost
+                str(killed_u),                                  # Units Killed
+                str(killed_b),                                  # Bldgs Killed
+                f"{bldgs_build}/{lost_b}",                     # Bldgs Build/Lost
+                f"{harv_built}/{harv_lost}",                   # Harv/Shrp Build/Lost
+                f"{hq_built}/{hq_lost}",                       # HQs/Nest Build/Lost
+                str(tech_level),                                # Tech Level
+                f"{nodes_built}/{nodes_lost}" if team_name == "Alien" else "-",  # Nodes (Alien only)
+                commander,                                      # Commander
+            ]
         
         color = GRAPH_COLORS.get(team_name, (255, 255, 255))
         
@@ -2551,7 +2577,7 @@ def create_stats_table(stats_dict, current_time, width, height):
 
 
 
-def render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=None):
+def render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=None, harvester_stats=None):
     """
     Render the complete stats panel with 2 graphs + 2 tables.
     (Implementation - use render_stats_panel for caching)
@@ -2596,7 +2622,7 @@ def render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_
     
     # Table 1: Team Statistics (scaled gap after graphs)
     table1_y = graph2_y + graph_height + int(60 * config.get_scale_ratio())
-    table1_img = create_table1_team_stats(kill_stats, building_stats, player_stats, commanders, current_time, width, table1_height)
+    table1_img = create_table1_team_stats(kill_stats, building_stats, player_stats, commanders, current_time, width, table1_height, harvester_stats=harvester_stats)
     panel.alpha_composite(table1_img, (10, table1_y))
     
     # Table 2: Player Leaderboard / Achievements (reduced width - chat takes right half)
@@ -2609,17 +2635,17 @@ def render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_
     return panel
 
 
-def render_stats_panel(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=None):
+def render_stats_panel(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=None, harvester_stats=None):
     """
     Wrapper that calls render_stats_panel_impl.
     Caching is handled by the RenderCache class in render_frame.
     """
-    return render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=resource_stats)
+    return render_stats_panel_impl(kill_stats, building_stats, player_stats, unit_kill_stats, commanders, current_time, width, height, resource_stats=resource_stats, harvester_stats=harvester_stats)
 
 
 
 
-def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, start_time=None, chat_messages=None, resource_stats=None, unit_positions=None, dying_units=None):
+def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_stats, unit_kill_stats, commanders, t, heat_overlay_rgba=None, world_extent=WORLD_EXTENT, timing_detail=None, frame_num=0, resources=None, victory_info=None, t_end=None, total_frames=0, map_name=None, log_date=None, start_time=None, chat_messages=None, resource_stats=None, unit_positions=None, dying_units=None, harvester_stats=None, kgt_data=None):
     """
     Render one frame at game time t (seconds).
     Layout: [MAP | KILLBAR | STATS PANEL]
@@ -2753,6 +2779,99 @@ def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_
             draw.ellipse((x_px - r, y_px - r, x_px + r, y_px + r), fill=(col[0], col[1], col[2], 200))
 
     t_start_time = record_time('buildings', t_start_time)
+
+    # --- KGT (King of the Galactic Teleport) overlay ---
+    # Minimal: the UltraHeavyFactory at the centre (Wildlife team tint) + 12 outposts
+    # around it. No capture circle, arc, or label — the structures alone convey the
+    # zone.
+    if kgt_data is not None and kgt_data.get('koh_spawn') is not None:
+        koh = kgt_data['koh_spawn']
+        ring = kgt_data.get('outpost_ring')
+
+        cx_px, cy_px = world_to_pixel(koh.x, koh.z, map_w, map_h, world_extent)
+
+        # World radius → pixel radius (assume square world_extent → uniform scale).
+        try:
+            we_w = world_extent[1] - world_extent[0]
+        except (TypeError, IndexError):
+            we_w = 4000.0
+        px_per_world = map_w / we_w if we_w else 1.0
+
+        # Centre: UltraHeavyFactory icon tinted Wildlife.
+        factory_icon = get_icon("UltraHeavyFactory", "Wildlife", "complete", config.ICON_SCALE)
+        if factory_icon is not None:
+            iw, ih = factory_icon.size
+            frame.alpha_composite(factory_icon, (int(cx_px - iw / 2), int(cy_px - ih / 2)))
+        else:
+            # Fallback: small wildlife-coloured dot.
+            wc = TEAM_COLORS.get("Wildlife", (180, 140, 80))
+            r = 5
+            draw.ellipse((cx_px - r, cy_px - r, cx_px + r, cy_px + r),
+                         fill=(wc[0], wc[1], wc[2], 230))
+
+        # Outposts around the ring. `count` evenly spaced. For each slot we look up
+        # the latest alive Outpost building at that world position from the buildings
+        # dict — that drives the team tint, so capture progress (team takes over →
+        # rebuilds with their colour) shows on the ring.
+        if ring is not None and ring.count > 0:
+            import math
+            ring_r_px = max(4, int(ring.radius * px_per_world))
+
+            # Pre-filter candidate outposts to those near the ring (cheap).
+            ring_outer = (ring.radius + 50.0) ** 2
+            ring_inner = max(0.0, ring.radius - 50.0) ** 2
+            outpost_candidates = []
+            for b in buildings.values():
+                if b.name != "Outpost":
+                    continue
+                if b.x is None or b.y is None:
+                    continue
+                d2 = (b.x - koh.x) ** 2 + (b.y - koh.z) ** 2
+                if d2 < ring_inner or d2 > ring_outer:
+                    continue
+                outpost_candidates.append(b)
+
+            slot_tol_sq = 30.0 * 30.0  # match within 30 m of the conceptual slot
+            for i in range(ring.count):
+                ang = (2.0 * math.pi * i) / ring.count - math.pi / 2.0
+                # Expected slot in world coords (KGT uses x, z planar).
+                slot_x = koh.x + ring.radius * math.cos(ang)
+                slot_z = koh.z + ring.radius * math.sin(ang)
+                # Pixel position derived from world_to_pixel (consistent with everything else).
+                sx_px, sy_px = world_to_pixel(slot_x, slot_z, map_w, map_h, world_extent)
+
+                # Pick latest alive outpost at this slot.
+                owner_team = "Wildlife"
+                best_t = -1.0
+                for b in outpost_candidates:
+                    dx = b.x - slot_x
+                    dz = b.y - slot_z
+                    if dx * dx + dz * dz > slot_tol_sq:
+                        continue
+                    # Alive at time t: completed (or at least started) and not destroyed/sold.
+                    ref_t = b.complete_t if b.complete_t is not None else b.start_t
+                    if ref_t is None or ref_t > t:
+                        continue
+                    if b.destroy_t is not None and t >= b.destroy_t:
+                        continue
+                    if b.sold_t is not None and t >= b.sold_t:
+                        continue
+                    if ref_t > best_t:
+                        best_t = ref_t
+                        owner_team = b.team or "Wildlife"
+
+                icon = get_icon("Outpost", owner_team, "complete", config.ICON_SCALE)
+                if icon is not None:
+                    iw, ih = icon.size
+                    frame.alpha_composite(icon, (int(sx_px - iw / 2), int(sy_px - ih / 2)))
+                else:
+                    oc = TEAM_COLORS.get(owner_team, TEAM_COLORS.get("Wildlife", (180, 140, 80)))
+                    dr = 3
+                    draw.ellipse((sx_px - dr, sy_px - dr, sx_px + dr, sy_px + dr),
+                                 fill=(oc[0], oc[1], oc[2], 230),
+                                 outline=(20, 20, 20, 220))
+
+    t_start_time = record_time('kgt', t_start_time)
 
     # --- Unit Positions (from .srpl data) — incremental overlay ---
     if unit_positions:
@@ -3120,7 +3239,7 @@ def render_frame(base_map, buildings, kills, kill_stats, building_stats, player_
         stats_panel = cache.get_stats_panel(
             frame_num, kill_stats, building_stats, player_stats,
             unit_kill_stats, commanders, t, config.STATS_WIDTH, config.VIDEO_HEIGHT, update_interval,
-            resource_stats=resource_stats
+            resource_stats=resource_stats, harvester_stats=harvester_stats
         )
         frame.alpha_composite(stats_panel, (map_w + config.KILLBAR_WIDTH, 0))
 
@@ -3222,14 +3341,14 @@ def render_scoreboard(player_stats, kill_stats, width, height, victory_info=None
     font_small = load_font(player_font_size - 2)
     
     # Group players by team
-    teams_order = ["Sol", "Centauri", "Alien"]
+    teams_order = ["Sol", "Centauri", "Alien", "Wildlife"]
     team_players = {team: [] for team in teams_order}
-    
+
     for player_name, stats in player_stats.items():
         # Skip AI units
         if is_ai_unit(player_name):
             continue
-        
+
         team = stats.team
         if team in team_players:
             # Calculate stats
@@ -3376,7 +3495,179 @@ def render_scoreboard(player_stats, kill_stats, width, height, victory_info=None
     footer_text = "Press any key to continue..."
     draw.text((width // 2, footer_y), footer_text, font=font_small,
               fill=(120, 120, 120, 255), anchor="mm")
-    
+
+    return img
+
+
+# Static list of all known unit and structure types for detailed stats.
+# Uses display names (ObjectInfo.ObjectInfoName) as registered in SRPL TypeRegister records.
+# Structures shared by Sol/Centauri listed once (the SRPL registers separate names for HQ only).
+DETAILED_STATS_UNITS = [
+    # Structures (shared Sol/Centauri)
+    "Sol Headquarters", "Cent Headquarters",
+    "Barracks", "Refinery", "Research Facility",
+    "Light Factory", "Heavy Factory", "Air Factory", "Ultra Heavy Factory",
+    "Silo", "Radar Station",
+    "Turret", "Heavy Turret", "Anti-Air Rocket Turret",
+    "Outpost", "Fusion Reactor", "Solar Panel",
+    # Structures (Alien)
+    "Nest", "Node", "Bio Cache", "Quantum Cortex",
+    "Lesser Spawning Cyst", "Greater Spawning Cyst", "Grand Spawning Cyst", "Colossal Spawning Cyst",
+    "Hive Spire", "Thorn Spire",
+    # Sol Soldiers
+    "Rifleman", "Scout", "Sniper", "Heavy", "Commando",
+    # Centauri Soldiers
+    "Militia", "Trooper", "Marksman", "Juggernaut", "Templar",
+    # Sol Vehicles
+    "Light Quad", "Platoon Hauler", "Heavy Quad", "Light Striker", "Heavy Striker", "AA Truck",
+    "Hover Tank", "Barrage Truck", "Railgun Tank", "Pulse Truck",
+    "Sol Harvester", "Siege Tank",
+    "Hover Bike", "Troop Transport", "Sports Car",
+    # Centauri Vehicles
+    "Light Raider", "Squad Transport", "Heavy Raider", "Assault Car", "Strike Tank", "Flak Car",
+    "Combat Tank", "Rocket Tank", "Heavy Tank", "Pyro Tank",
+    "Cent Harvester", "Crimson Tank",
+    # Sol Air
+    "Fighter", "Bomber", "Gunship", "Dropship",
+    # Centauri Air
+    "Interceptor", "Freighter", "Dreadnought", "Shuttle",
+    # Alien Creatures
+    "Crab", "Shrimp", "Shocker", "Wasp", "Dragonfly", "Squid",
+    "Horned Crab", "Hunter", "Behemoth", "Scorpion", "Firebug",
+    "Goliath", "Defiler", "Colossus", "Queen",
+    # Wildlife
+    "Worm", "Great Worm",
+]
+
+
+def render_detailed_stats(detailed_stats, width, height, victory_info=None):
+    """
+    Render detailed unit/structure statistics page (full-screen, split into two columns)
+    showing build/lost/killed counts for each unit type, per faction including Wildlife.
+
+    Layout: two side-by-side tables, each with Name + Sol/Centauri/Alien/Wildlife BLK columns.
+    Left table: rows 1..N/2, Right table: rows N/2+1..N.
+    """
+    bg_alpha = getattr(config, 'SCOREBOARD_BG_ALPHA', 220)
+    img = Image.new("RGBA", (width, height), (20, 20, 20, bg_alpha))
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    teams = ["Sol", "Centauri", "Alien", "Wildlife"]
+    all_types = list(DETAILED_STATS_UNITS)
+    if not all_types:
+        return img
+
+    # Split list into left and right halves
+    mid = (len(all_types) + 1) // 2  # left gets the extra row if odd
+    left_types = all_types[:mid]
+    right_types = all_types[mid:]
+
+    # Layout
+    margin_x = int(width * 0.01)
+    margin_top = int(height * 0.01)
+    margin_bottom = int(height * 0.01)
+    panel_gap = int(width * 0.015)  # gap between left and right panels
+
+    panel_width = (width - 2 * margin_x - panel_gap) // 2
+    rows_per_panel = mid  # left has mid rows, right has len-mid
+
+    # Header area: team name row + B/L/K row
+    scale = config.get_scale_ratio()
+    col_header_font_size = max(10, int(14 * scale))
+    font_col_header = load_font(col_header_font_size)
+    header_row_height = int(col_header_font_size * 1.6)
+    header_area = header_row_height * 2 + int(4 * scale)
+
+    data_start_y = margin_top + header_area
+    available_height = height - data_start_y - margin_bottom
+    row_height = max(14, available_height // rows_per_panel)
+
+    # Font sizes proportional to row height
+    row_font_size = max(10, min(int(row_height * 0.70), int(22 * scale)))
+    font_row = load_font(row_font_size)
+
+    # Column widths within each panel: name + 4 teams × 3 sub-columns
+    name_col_width = int(panel_width * 0.22)
+    remaining = panel_width - name_col_width
+    team_gap = int(remaining * 0.008)
+    team_col_width = (remaining - team_gap * (len(teams) - 1)) // len(teams)
+    sub_col_width = team_col_width // 3
+
+    def draw_panel(panel_x, type_list):
+        """Draw one half of the split-screen table."""
+        total_w = name_col_width + len(teams) * team_col_width + team_gap * (len(teams) - 1)
+
+        # Header row 1: team names
+        team_name_y = margin_top + header_row_height // 2
+        # Header row 2: B / L / K
+        blk_y = margin_top + header_row_height + header_row_height // 2
+
+        # Name column header
+        draw.text((panel_x + 4, blk_y), "Unit / Structure",
+                  font=font_col_header, fill=(200, 200, 200, 255), anchor="lm")
+
+        x = panel_x + name_col_width
+        for team in teams:
+            team_color = TEAM_COLORS.get(team, (255, 255, 255))
+            cx = x + team_col_width // 2
+            draw.text((cx, team_name_y), team,
+                      font=font_col_header, fill=(*team_color, 255), anchor="mm")
+            for s_idx, label in enumerate(["B", "L", "K"]):
+                sx = x + s_idx * sub_col_width + sub_col_width // 2
+                draw.text((sx, blk_y), label,
+                          font=font_col_header, fill=(160, 160, 160, 255), anchor="mm")
+            x += team_col_width + team_gap
+
+        # Separator line
+        sep_y = data_start_y - int(2 * scale)
+        draw.line([(panel_x, sep_y), (panel_x + total_w, sep_y)],
+                  fill=(80, 80, 80, 200), width=1)
+
+        # Data rows
+        y = data_start_y
+        for row_idx, type_name in enumerate(type_list):
+            if y + row_height > height - margin_bottom:
+                break
+
+            # Alternating row background
+            if row_idx % 2 == 0:
+                draw.rectangle([panel_x, y, panel_x + total_w, y + row_height - 1],
+                               fill=(35, 35, 35, 180))
+
+            text_y = y + row_height // 2
+            draw.text((panel_x + 4, text_y), type_name, font=font_row,
+                      fill=(200, 200, 200, 255), anchor="lm")
+
+            x = panel_x + name_col_width
+            for team in teams:
+                t_stats = detailed_stats.get(team, {})
+                entry = t_stats.get(type_name, {})
+                built = entry.get("built", 0)
+                lost = entry.get("lost", 0)
+                killed = entry.get("killed", 0)
+
+                team_color = TEAM_COLORS.get(team, (255, 255, 255))
+                dim_color = tuple(max(50, c // 3) for c in team_color)
+
+                for s_idx, val in enumerate([built, lost, killed]):
+                    sx = x + s_idx * sub_col_width + sub_col_width // 2
+                    if val > 0:
+                        draw.text((sx, text_y), str(val), font=font_row,
+                                  fill=(*team_color, 255), anchor="mm")
+                    else:
+                        draw.text((sx, text_y), "-", font=font_row,
+                                  fill=(*dim_color, 100), anchor="mm")
+
+                x += team_col_width + team_gap
+
+            y += row_height
+
+    # Draw left and right panels
+    left_x = margin_x
+    right_x = margin_x + panel_width + panel_gap
+    draw_panel(left_x, left_types)
+    draw_panel(right_x, right_types)
+
     return img
 
 

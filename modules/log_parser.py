@@ -442,23 +442,33 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
             continue
         m_kgt_king = re_kgt_king_change.search(line)
         if m_kgt_king:
-            game_info['kgt']['king_changes'].append(KohKingChange(
-                t,
-                m_kgt_king.group("team"), m_kgt_king.group("prev"),
-                float(m_kgt_king.group("pct"))
-            ))
+            team = m_kgt_king.group("team")
+            prev = m_kgt_king.group("prev")
+            pct = float(m_kgt_king.group("pct"))
+            game_info['kgt']['king_changes'].append(KohKingChange(t, team, prev, pct))
+            # Mirror to chat timeline so admins see it in the replay's chat panel.
+            if prev == "none":
+                msg = f"KGT: {team} takes the Galactic Teleporter ({pct:.0f}%)"
+            else:
+                msg = f"KGT: {team} wrests the Teleporter from {prev} ({pct:.0f}%)"
+            chat_messages.append(ChatMessage(t, "Server", "System", msg, False))
             continue
         m_kgt_prog = re_kgt_progress.search(line)
         if m_kgt_prog:
-            game_info['kgt']['progress_events'].append(KohProgress(
-                t,
-                m_kgt_prog.group("team"), int(m_kgt_prog.group("pct")),
-                float(m_kgt_prog.group("acc")), float(m_kgt_prog.group("th"))
-            ))
+            team = m_kgt_prog.group("team")
+            pct = int(m_kgt_prog.group("pct"))
+            acc = float(m_kgt_prog.group("acc"))
+            th = float(m_kgt_prog.group("th"))
+            game_info['kgt']['progress_events'].append(KohProgress(t, team, pct, acc, th))
+            chat_messages.append(ChatMessage(t, "Server", "System",
+                f"KGT: {team} {pct}% ({acc:.0f}/{th:.0f})", False))
             continue
         m_kgt_win = re_kgt_win.search(line)
         if m_kgt_win:
-            game_info['kgt']['win'] = KohWin(t, m_kgt_win.group("winner"))
+            winner = m_kgt_win.group("winner")
+            game_info['kgt']['win'] = KohWin(t, winner)
+            chat_messages.append(ChatMessage(t, "Server", "System",
+                f"KGT: {winner} captures the Galactic Teleporter — round won", False))
             continue
 
         # Construction
@@ -473,10 +483,20 @@ def parse_buildings_and_kills_from_log(log_path: str, gametype_filter: str = Non
             key = (team, name, x, y)
             rec = tmp[key]
             rec["team"], rec["name"], rec["x"], rec["y"] = team, name, x, y
-            if status == "start" and rec["start_t"] is None:
-                rec["start_t"] = t
-            elif status == "complete" and rec["complete_t"] is None:
+            if status == "start":
+                if rec["start_t"] is None:
+                    rec["start_t"] = t
+                # Re-construction cycle: clear stale destroy/sold so the renderer treats
+                # this entry as alive again (KGT outpost respawn keeps the same key for
+                # unchanged-team slots).
+                rec["destroy_t"] = None
+                rec["sold_t"] = None
+            elif status == "complete":
+                # Always update complete_t for re-completions so the renderer's "latest
+                # alive" pick prefers the most recent build at this slot.
                 rec["complete_t"] = t
+                rec["destroy_t"] = None
+                rec["sold_t"] = None
             continue
 
         # Structure sold

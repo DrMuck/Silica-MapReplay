@@ -32,7 +32,7 @@ from tqdm import tqdm
 # Import all modules
 import config
 from data_models import Building, KillEvent, DeathEvent
-from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_unit_kill_stats, build_resource_stats_from_log, build_kill_stats_from_srpl
+from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_unit_kill_stats, build_resource_stats_from_log, build_kill_stats_from_srpl, build_harvester_stats_from_srpl, build_detailed_unit_stats_from_srpl
 from log_parser import parse_buildings_and_kills_from_log, world_to_pixel
 from renderer import render_frame, make_heatmap_image
 from icon_config import MISSING_ICON_TYPES
@@ -242,11 +242,17 @@ def make_video():
 
     # If SRPL data available, rebuild kill_stats from ALL destructions (including AI vs AI)
     # The log-based kills list is kept for the killbar (player-related kills only)
+    harvester_stats = None
     if srpl_replay:
-        kill_stats = build_kill_stats_from_srpl(srpl_replay)
+        kill_stats = build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien", "Wildlife"])
         total_kills = sum(s.killed_units + s.killed_buildings for s in kill_stats.values())
         print(f"Kill stats rebuilt from SRPL: {total_kills} total kills (all, incl. AI vs AI)")
-    
+        # Build harvester/shrimp stats from SRPL entity data
+        harvester_stats = build_harvester_stats_from_srpl(srpl_replay)
+        for team, h in harvester_stats.items():
+            if h["built"] > 0:
+                print(f"  {team}: Harv/Shrp built={h['built']}, lost={h['lost']}")
+
     # Build player statistics
     print("Building player statistics...")
     player_stats = build_player_stats_from_kills(kills)
@@ -510,6 +516,8 @@ def make_video():
                 resource_stats=resource_stats,
                 unit_positions=srpl_units,
                 dying_units=dying_eids,
+                harvester_stats=harvester_stats,
+                kgt_data=game_info.get('kgt'),
             )
             
             frame_num += 1  # Increment frame counter
@@ -557,7 +565,30 @@ def make_video():
                 writer.append_data(scoreboard_rgb)
             
             print(f"Scoreboard added: {scoreboard_frames} frames ({scoreboard_frames / config.VIDEO_FPS:.1f}s)")
-                
+
+        # === DETAILED STATS RENDERING (from SRPL data) ===
+        detailed_stats_frames = getattr(config, 'DETAILED_STATS_FRAMES', 10)
+        if srpl_replay and detailed_stats_frames > 0:
+            print(f"\nRendering detailed statistics ({detailed_stats_frames} frames)...")
+
+            from renderer import render_detailed_stats
+
+            detailed_stats = build_detailed_unit_stats_from_srpl(srpl_replay)
+            detailed_img = render_detailed_stats(
+                detailed_stats,
+                config.VIDEO_WIDTH,
+                config.VIDEO_HEIGHT,
+                victory_info=victory_info
+            )
+            detailed_rgb = np.array(detailed_img.convert("RGB"))
+
+            # Show for ~10 seconds at configured FPS
+            actual_frames = detailed_stats_frames * config.VIDEO_FPS
+            for _ in tqdm(range(actual_frames), desc="Detailed stats frames"):
+                writer.append_data(detailed_rgb)
+
+            print(f"Detailed stats added: {actual_frames} frames ({actual_frames / config.VIDEO_FPS:.1f}s)")
+
     except KeyboardInterrupt:
         print("\n\n" + chr(0x26A0) + chr(0xFE0F) + "  Rendering cancelled by user (Ctrl+C)")
         cancelled = True

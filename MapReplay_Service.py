@@ -51,8 +51,8 @@ except ImportError:
 # Import modules (after path is set up)
 import numpy as np
 import config as cfg
-from data_models import Building, KillEvent, DeathEvent, VictoryInfo, Resource, ChatMessage, ResourceStatusEvent
-from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_resource_stats_from_log, build_kill_stats_from_srpl
+from data_models import Building, KillEvent, DeathEvent, VictoryInfo, Resource, ChatMessage, ResourceStatusEvent, KohSpawn, OutpostRing, KohKingChange, KohProgress, KohWin
+from statistics import build_all_stats_from_log, build_player_stats_from_kills, build_resource_stats_from_log, build_kill_stats_from_srpl, build_harvester_stats_from_srpl
 from srpl_reader import LiveSrplReader
 from renderer import render_frame, render_scoreboard, clear_render_cache
 import gc  # For garbage collection
@@ -290,11 +290,12 @@ class DiscordUploader:
         commander_str = ""
         if commanders:
             cmd_parts = []
-            for team in ["Sol", "Centauri", "Alien"]:
+            for team in ["Sol", "Centauri", "Alien", "Wildlife"]:
                 if team in commanders and commanders[team]:
                     # Get the last commander for this team
                     last_cmd = commanders[team][-1][1]  # (time, player_name)
-                    cmd_parts.append(f"{team}: {last_cmd}")
+                    if last_cmd:
+                        cmd_parts.append(f"{team}: {last_cmd}")
             if cmd_parts:
                 commander_str = f"\n{E_CROWN} " + " | ".join(cmd_parts)
         
@@ -591,6 +592,17 @@ class LiveGameState:
         self.chat_messages = []  # Chat messages from players
         self.resource_status_events = []  # ResourceStatusEvent list for graph 2
 
+        # Si_KingOfTheHill (KGT) per-round state. Populated from HL "World triggered"
+        # kgt_* events emitted by the KoH mod. Renderer reads this dict to draw the
+        # capture structure + outpost ring + capture-progress arc.
+        self.kgt = {
+            'koh_spawn': None,
+            'outpost_ring': None,
+            'king_changes': [],
+            'progress_events': [],
+            'win': None,
+        }
+
         # Tracking
         self.kill_counter = 0
         self.last_event_time = start_time
@@ -734,6 +746,16 @@ class LiveLogParser:
         )
         # Chat command filter (balance UI commands: /b, /1 through /30)
         self.re_chat_command = re.compile(r'^/b\b|^/([12]?\d|30)\b')
+        # Map layout announcement from MapBalance mod (game log format)
+        self.re_map_layout = re.compile(r'World triggered "map_layout" \(layout "(?P<layout>[^"]+)"\)')
+
+        # Si_KingOfTheHill (KGT) events. Emitted via HL_Logging.PrintLogLine from the
+        # KoH mod. Drives the centre marker, outpost ring, capture arc, and chat mirror.
+        self.re_kgt_koh_spawn    = re.compile(r'World triggered "kgt_koh_spawn" \(x "(?P<x>-?\d+(?:\.\d+)?)"\) \(z "(?P<z>-?\d+(?:\.\d+)?)"\) \(capture_radius "(?P<cr>\d+(?:\.\d+)?)"\) \(exclusion_radius "(?P<er>\d+(?:\.\d+)?)"\) \(win_threshold "(?P<wt>\d+(?:\.\d+)?)"\)')
+        self.re_kgt_outpost_ring = re.compile(r'World triggered "kgt_outpost_ring" \(center_x "(?P<cx>-?\d+(?:\.\d+)?)"\) \(center_z "(?P<cz>-?\d+(?:\.\d+)?)"\) \(radius "(?P<r>\d+(?:\.\d+)?)"\) \(count "(?P<n>\d+)"\) \(bury_depth "(?P<bd>\d+(?:\.\d+)?)"\)')
+        self.re_kgt_king_change  = re.compile(r'World triggered "kgt_king_change" \(team "(?P<team>[^"]+)"\) \(previous_team "(?P<prev>[^"]+)"\) \(progress_pct "(?P<pct>\d+(?:\.\d+)?)"\)')
+        self.re_kgt_progress     = re.compile(r'World triggered "kgt_progress" \(team "(?P<team>[^"]+)"\) \(pct "(?P<pct>\d+)"\) \(accumulated "(?P<acc>\d+(?:\.\d+)?)"\) \(threshold "(?P<th>\d+(?:\.\d+)?)"\)')
+        self.re_kgt_win          = re.compile(r'World triggered "kgt_win" \(winner "(?P<winner>[^"]+)"\)')
 
         # Date extraction for cleanlog format
         self.re_date_cleanlog = re.compile(r'L (\d{2})/(\d{2})/(\d{4}) -')
@@ -862,6 +884,12 @@ class LiveLogParser:
             getattr(self, '_pending_map_name', None) and \
             (self.re_construction.search(line) or self.re_resource_status.search(line) or
              self.re_struct_kill.search(line))
+        # Suppress auto-detect for ~30s after Round_Win: trailing resource_status / mop-up
+        # kill / construction_complete events cause a phantom "new game" otherwise.
+        if is_gameplay_event:
+            last_end = getattr(self, '_last_game_end_abs_t', None)
+            if last_end is not None and (t_abs - last_end) < 30.0:
+                is_gameplay_event = False
 
         if m_start or is_gameplay_event:
             if m_start:
@@ -965,6 +993,8 @@ class LiveLogParser:
             # Re-arm pending map for consecutive games on same map (no Loading map between them)
             if game.map_name and game.map_name != "Unknown":
                 self._pending_map_name = game.map_name
+            # Timestamp end so we can suppress phantom auto-detects from trailing events
+            self._last_game_end_abs_t = t_abs
             self.logger.info(f"Game ended (Round_Win) at t={t:.1f}s")
             return "game_end"
         
@@ -997,9 +1027,16 @@ class LiveLogParser:
                 
                 if status == "start":
                     game.buildings[key]["start_t"] = t
+                    # Re-construction at the same (team, name, x, y) — clear destroy/sold
+                    # markers from a prior cycle so the renderer treats the entry as alive
+                    # again. Triggered by KGT outpost respawn for unchanged-team slots.
+                    game.buildings[key]["destroy_t"] = None
+                    game.buildings[key]["sold_t"] = None
                 else:
                     game.buildings[key]["complete_t"] = t
-                
+                    game.buildings[key]["destroy_t"] = None
+                    game.buildings[key]["sold_t"] = None
+
                 event_processed = True
         
         # Structure sold
@@ -1242,10 +1279,75 @@ class LiveLogParser:
                         self.logger.debug(f"Chat: {player_name} [{team}]: {message}")
                         event_processed = True
         
+        # Map layout announcement from MapBalance mod (game log format)
+        if not event_processed:
+            m_layout = self.re_map_layout.search(line)
+            if m_layout:
+                layout_name = m_layout.group("layout")
+                layout_msg = f"Map Balance: {layout_name}"
+                game.chat_messages.append(ChatMessage(t, "Server", "System", layout_msg, False))
+                self.logger.info(f"Map layout detected: {layout_msg}")
+                event_processed = True
+
+        # Si_KingOfTheHill (KGT) events. Populate game.kgt and mirror milestone/win/king
+        # transitions into the chat panel so they're visible on the replay timeline.
+        if not event_processed:
+            m_kgt = self.re_kgt_koh_spawn.search(line)
+            if m_kgt:
+                game.kgt['koh_spawn'] = KohSpawn(
+                    t, float(m_kgt.group('x')), float(m_kgt.group('z')),
+                    float(m_kgt.group('cr')), float(m_kgt.group('er')),
+                    float(m_kgt.group('wt'))
+                )
+                self.logger.info(f"KGT KoH spawn: ({m_kgt.group('x')}, {m_kgt.group('z')}) r={m_kgt.group('cr')}")
+                event_processed = True
+        if not event_processed:
+            m_kgt = self.re_kgt_outpost_ring.search(line)
+            if m_kgt:
+                game.kgt['outpost_ring'] = OutpostRing(
+                    t, float(m_kgt.group('cx')), float(m_kgt.group('cz')),
+                    float(m_kgt.group('r')), int(m_kgt.group('n')),
+                    float(m_kgt.group('bd'))
+                )
+                self.logger.info(f"KGT outpost ring: r={m_kgt.group('r')} count={m_kgt.group('n')}")
+                event_processed = True
+        if not event_processed:
+            m_kgt = self.re_kgt_king_change.search(line)
+            if m_kgt:
+                team = m_kgt.group('team')
+                prev = m_kgt.group('prev')
+                pct = float(m_kgt.group('pct'))
+                game.kgt['king_changes'].append(KohKingChange(t, team, prev, pct))
+                msg = (f"KGT: {team} takes the Galactic Teleporter ({pct:.0f}%)"
+                       if prev == "none"
+                       else f"KGT: {team} wrests the Teleporter from {prev} ({pct:.0f}%)")
+                game.chat_messages.append(ChatMessage(t, "Server", "System", msg, False))
+                event_processed = True
+        if not event_processed:
+            m_kgt = self.re_kgt_progress.search(line)
+            if m_kgt:
+                team = m_kgt.group('team')
+                pct = int(m_kgt.group('pct'))
+                acc = float(m_kgt.group('acc'))
+                th = float(m_kgt.group('th'))
+                game.kgt['progress_events'].append(KohProgress(t, team, pct, acc, th))
+                game.chat_messages.append(ChatMessage(t, "Server", "System",
+                    f"KGT: {team} {pct}% ({acc:.0f}/{th:.0f})", False))
+                event_processed = True
+        if not event_processed:
+            m_kgt = self.re_kgt_win.search(line)
+            if m_kgt:
+                winner = m_kgt.group('winner')
+                game.kgt['win'] = KohWin(t, winner)
+                game.chat_messages.append(ChatMessage(t, "Server", "System",
+                    f"KGT: {winner} captures the Galactic Teleporter — round won", False))
+                self.logger.info(f"KGT win: {winner}")
+                event_processed = True
+
         if event_processed:
             game.update_last_event(t_abs)
             return "event"
-        
+
         return None
 
 
@@ -1566,6 +1668,7 @@ class LiveFrameGenerator:
         # Build stats
         kill_stats, building_stats = build_all_stats_from_log(
             buildings, game.kills,
+            teams=["Sol", "Centauri", "Alien", "Wildlife"],
             team_tech_events=dict(game.team_tech_events)
         )
         player_stats = build_player_stats_from_kills(game.kills)
@@ -1588,10 +1691,14 @@ class LiveFrameGenerator:
         # Build resource stats for graph 2
         resource_stats = None
         if game.resource_status_events:
-            resource_stats = build_resource_stats_from_log(game.resource_status_events)
+            resource_stats = build_resource_stats_from_log(
+                game.resource_status_events,
+                teams=["Sol", "Centauri", "Alien", "Wildlife"],
+            )
 
         # Refresh SRPL data and override kill_stats with full kill data
         srpl_replay = None
+        harvester_stats = None
         if not self.srpl_reader:
             # Retry finding SRPL file (may not have existed at game start)
             self._open_srpl_for_game(game)
@@ -1605,7 +1712,10 @@ class LiveFrameGenerator:
             srpl_replay = self.srpl_reader.replay
             # Override kill_stats with SRPL data (includes AI vs AI kills)
             if srpl_replay and srpl_replay.destructions:
-                kill_stats = build_kill_stats_from_srpl(srpl_replay)
+                kill_stats = build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien", "Wildlife"])
+                harvester_stats = build_harvester_stats_from_srpl(srpl_replay)
+            else:
+                harvester_stats = None
 
         # Generate frames
         start_t = game.last_frame_time
@@ -1669,6 +1779,8 @@ class LiveFrameGenerator:
                     resource_stats=resource_stats,
                     unit_positions=srpl_units,
                     dying_units=dying_eids,
+                    harvester_stats=harvester_stats,
+                    kgt_data=game.kgt,  # Si_KingOfTheHill capture-point overlay
                 )
                 
                 # Write frame - convert to numpy array and immediately write
@@ -1748,10 +1860,29 @@ class LiveFrameGenerator:
                     self.video_writer.append_data(scoreboard_rgb)
                 
                 self.logger.info(f"Added scoreboard ({scoreboard_frames} frames)")
-                
+
         except Exception as e:
             self.logger.error(f"Error adding scoreboard: {e}")
-        
+
+        # Add detailed unit/structure stats (requires SRPL)
+        try:
+            detailed_stats_seconds = getattr(cfg, 'DETAILED_STATS_FRAMES', 10)
+            if self.srpl_reader and self.srpl_reader.replay and detailed_stats_seconds > 0:
+                from renderer import render_detailed_stats
+                from statistics import build_detailed_unit_stats_from_srpl
+                detailed_stats = build_detailed_unit_stats_from_srpl(self.srpl_reader.replay)
+                detailed_img = render_detailed_stats(
+                    detailed_stats, cfg.VIDEO_WIDTH, cfg.VIDEO_HEIGHT,
+                    victory_info=game.victory_info
+                )
+                detailed_rgb = np.array(detailed_img.convert("RGB"))
+                actual_frames = detailed_stats_seconds * cfg.VIDEO_FPS
+                for _ in range(actual_frames):
+                    self.video_writer.append_data(detailed_rgb)
+                self.logger.info(f"Added detailed stats ({actual_frames} frames)")
+        except Exception as e:
+            self.logger.error(f"Error adding detailed stats: {e}")
+
         # Close video writer
         try:
             self.video_writer.close()
