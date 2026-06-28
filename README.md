@@ -4,6 +4,10 @@ Real-time game replay generation for Silica Dedicated Server.
 Requirement! Databomb's logging mod needs to be installed, thus the game replays are fetched from the generated logs (see https://github.com/data-bomb/Silica).
 Logs are fetched from ..\Silica Dedicated Server\Userdata\logs
 
+![MapReplay end-of-round view — NorthPolarCap, 135 minutes elapsed](docs/screenshots/north_polar_cap_end_state.jpg)
+
+*Sample output frame from a finished round on NorthPolarCap. From left to right: live map view with every unit / building / kill marker; a per-kill scrolling killbar; cumulative kills + resources graphs; per-team stats table; achievements; and the full chat panel. Together they reconstruct a complete spectator view of the match.*
+
 ## Overview
 
 This service monitors the game server log files and automatically generates map replay videos as games are being played. It runs in the background with minimal CPU impact on the game server.
