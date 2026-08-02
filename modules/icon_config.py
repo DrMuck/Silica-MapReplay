@@ -48,6 +48,7 @@ def preload_all_icons(icon_dir=None):
         "512x512_Sol_Logo-01.png",
         "Centauri_512x512-01-01.png",
         "512x512_alien_logo.png",
+        "Wildlife_Logo.png",
         "Silica_Logo.png",
     ]
     

@@ -234,6 +234,8 @@ def parse_srpl(filepath):
                     eid, team, tid, is_unit = struct.unpack("<HBBB", f.read(5))
                     ctrl = 0
                 x, y = struct.unpack("<hh", f.read(4))
+                if replay.version >= 3:
+                    f.read(2)  # v3: extra uint16 (z or health)
                 type_name = replay.types.get(tid, f"type#{tid}")
                 entity = SrplEntity(eid, team, type_name, bool(is_unit), ctrl, x, y)
                 replay.entities[eid] = entity
@@ -250,9 +252,15 @@ def parse_srpl(filepath):
             elif rec_type == 0x10:  # TickFrame
                 tick, count = struct.unpack("<HH", f.read(4))
                 positions = {}
-                for _ in range(count):
-                    eid, x, y = struct.unpack("<Hhh", f.read(6))
-                    positions[eid] = (x, y)
+                if replay.version >= 3:
+                    for _ in range(count):
+                        eid, x, y = struct.unpack("<Hhh", f.read(6))
+                        f.read(2)  # v3: extra int16 (z coordinate)
+                        positions[eid] = (x, y)
+                else:
+                    for _ in range(count):
+                        eid, x, y = struct.unpack("<Hhh", f.read(6))
+                        positions[eid] = (x, y)
                 replay.ticks[tick] = positions
                 if tick > replay.max_tick:
                     replay.max_tick = tick
@@ -387,6 +395,10 @@ class LiveSrplReader:
                     if len(data2) < 4:
                         f.seek(pos_before); break
                     x, y = struct.unpack("<hh", data2)
+                    if self.replay.version >= 3:
+                        extra = f.read(2)  # v3: extra uint16
+                        if len(extra) < 2:
+                            f.seek(pos_before); break
                     type_name = self.replay.types.get(tid, f"type#{tid}")
                     entity = SrplEntity(eid, team, type_name, bool(is_unit), ctrl, x, y)
                     if ctrl > 0:
@@ -421,13 +433,14 @@ class LiveSrplReader:
                     if len(data) < 4:
                         f.seek(pos_before); break
                     tick, count = struct.unpack("<HH", data)
-                    needed = count * 6
+                    pos_per_entity = 8 if self.replay.version >= 3 else 6  # v3 adds z coord
+                    needed = count * pos_per_entity
                     payload = f.read(needed)
                     if len(payload) < needed:
                         f.seek(pos_before); break
                     positions = {}
                     for i in range(count):
-                        off = i * 6
+                        off = i * pos_per_entity
                         eid, x, y = struct.unpack("<Hhh", payload[off:off+6])
                         positions[eid] = (x, y)
                     self.replay.ticks[tick] = positions

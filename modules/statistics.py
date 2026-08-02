@@ -11,7 +11,7 @@ import logging
 from data_models import TeamStats, BuildingStats, PlayerStats, ResourceStats
 from icon_config import normalize_unit_name, is_ai_unit, is_greatworm
 
-def build_building_stats_from_log(buildings, teams=["Sol", "Centauri", "Alien"], team_tech_events=None):
+def build_building_stats_from_log(buildings, teams=["Sol", "Centauri", "Alien", "Wildlife"], team_tech_events=None):
 
     """
     Build BuildingStats objects from building data.
@@ -81,7 +81,7 @@ def build_building_stats_from_log(buildings, teams=["Sol", "Centauri", "Alien"],
 
 
 
-def build_stats_from_kills(kills, teams=["Sol", "Centauri", "Alien"]):
+def build_stats_from_kills(kills, teams=["Sol", "Centauri", "Alien", "Wildlife"]):
     """
     Build TeamStats objects from kill events.
     
@@ -143,7 +143,7 @@ def get_all_team_building_stats_at_time(building_stats_dict, current_time):
 
 
 
-def build_all_stats_from_log(buildings, kills, teams=["Sol", "Centauri", "Alien"], team_tech_events=None):
+def build_all_stats_from_log(buildings, kills, teams=["Sol", "Centauri", "Alien", "Wildlife"], team_tech_events=None):
 
     """
     Build both kill stats and building stats.
@@ -261,7 +261,7 @@ def build_unit_kill_stats(kills):
     return unit_kills
 
 
-def build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien"]):
+def build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien", "Wildlife"]):
     """
     Build TeamStats from SRPL destruction events (includes ALL kills, not just player-related).
 
@@ -275,7 +275,7 @@ def build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien"]):
     stats = {team: TeamStats(team) for team in teams}
 
     for tick, victim_id, attacker_id, is_building in sorted(srpl_replay.destructions, key=lambda d: d[0]):
-        time_s = srpl_replay.tick_to_seconds(tick)
+        time_s = srpl_replay.tick_to_seconds(tick) - srpl_replay.time_offset
         victim_ent = srpl_replay.entities.get(victim_id)
         attacker_ent = srpl_replay.entities.get(attacker_id)
 
@@ -298,7 +298,94 @@ def build_kill_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien"]):
     return stats
 
 
-def build_resource_stats_from_log(resource_status_events, teams=["Sol", "Centauri", "Alien"]):
+def build_harvester_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien", "Wildlife"]):
+    """
+    Build harvester/shrimp build/lost counts from SRPL entity registrations and destructions.
+
+    For Sol/Centauri: counts entities whose type_name contains "Harvester"
+    For Alien: counts entities whose type_name is "Shrimp"
+
+    Returns:
+        dict: {team_name: {"built": int, "lost": int}}
+    """
+    harvester_types = {"Harvester", "HoverHarvester", "HeavyHarvester"}
+
+    stats = {team: {"built": 0, "lost": 0} for team in teams}
+
+    # Count registrations (built)
+    destroyed_ids = {d[1] for d in srpl_replay.destructions}
+
+    for eid, entity in srpl_replay.entities.items():
+        if not entity.is_unit:
+            continue
+        team = entity.team_name
+        if team not in stats:
+            continue
+        type_name = entity.type_name
+
+        is_harvester = False
+        if team == "Alien":
+            is_harvester = (type_name == "Shrimp")
+        else:
+            is_harvester = any(h in type_name for h in harvester_types)
+
+        if is_harvester:
+            stats[team]["built"] += 1
+            if eid in destroyed_ids:
+                stats[team]["lost"] += 1
+
+    return stats
+
+
+def build_detailed_unit_stats_from_srpl(srpl_replay, teams=["Sol", "Centauri", "Alien", "Wildlife"]):
+    """
+    Build per-unit-type build/lost/killed counts from SRPL data.
+
+    Returns:
+        dict: {team_name: {type_name: {"built": int, "lost": int, "killed": int}}}
+    """
+    stats = {team: {} for team in teams}
+
+    # Map victim_id -> attacker team for kill credit
+    destruction_map = {}  # victim_id -> attacker_team
+    for tick, vid, aid, is_building in srpl_replay.destructions:
+        attacker_ent = srpl_replay.entities.get(aid)
+        attacker_team = attacker_ent.team_name if attacker_ent else "Unknown"
+        destruction_map[vid] = attacker_team
+
+    destroyed_ids = set(destruction_map.keys())
+
+    for eid, entity in srpl_replay.entities.items():
+        team = entity.team_name
+        if team not in stats:
+            continue
+        type_name = entity.type_name
+
+        if type_name not in stats[team]:
+            stats[team][type_name] = {"built": 0, "lost": 0, "killed": 0}
+
+        stats[team][type_name]["built"] += 1
+        if eid in destroyed_ids:
+            stats[team][type_name]["lost"] += 1
+
+    # Count killed (what each team destroyed)
+    for tick, vid, aid, is_building in srpl_replay.destructions:
+        attacker_ent = srpl_replay.entities.get(aid)
+        victim_ent = srpl_replay.entities.get(vid)
+        if attacker_ent is None or victim_ent is None:
+            continue
+        attacker_team = attacker_ent.team_name
+        if attacker_team not in stats:
+            continue
+        victim_type = victim_ent.type_name
+        if victim_type not in stats[attacker_team]:
+            stats[attacker_team][victim_type] = {"built": 0, "lost": 0, "killed": 0}
+        stats[attacker_team][victim_type]["killed"] += 1
+
+    return stats
+
+
+def build_resource_stats_from_log(resource_status_events, teams=["Sol", "Centauri", "Alien", "Wildlife"]):
     """
     Build ResourceStats objects from resource_status events parsed from the log.
     

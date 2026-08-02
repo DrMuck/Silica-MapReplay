@@ -65,7 +65,7 @@ RESOLUTION_CONFIGS = {
         "table1_row_height": 24,
         "table1_header_height": 16,
         "table1_icon_size": 20,
-        "table1_height": 100,
+        "table1_height": 124,
         "table1_x_offset": -10,
         
         # Table 2 (Achievements)
@@ -106,6 +106,7 @@ RESOLUTION_CONFIGS = {
         "resource_icon_scale": 0.45,
         "kill_icon_scale": 1.2,
         "kill_soldier_scale": 0.6,
+        "map_vehicle_overlay_scale": 0.75,  # Extra shrink for vehicle/creature/air icons on live map (soldiers unaffected)
         
         # Killbar settings
         "killbar_entry_height": 22,
@@ -139,7 +140,7 @@ RESOLUTION_CONFIGS = {
         "table1_row_height": 36,
         "table1_header_height": 22,
         "table1_icon_size": 28,
-        "table1_height": 150,
+        "table1_height": 186,
         "table1_x_offset": 0,
         
         # Table 2 (Achievements)
@@ -213,7 +214,7 @@ RESOLUTION_CONFIGS = {
         "table1_row_height": 48,
         "table1_header_height": 28,
         "table1_icon_size": 34,
-        "table1_height": 210,
+        "table1_height": 258,
         "table1_x_offset": 0,
 
         # Table 2 (Achievements)
@@ -287,7 +288,7 @@ RESOLUTION_CONFIGS = {
         "table1_row_height": 72,
         "table1_header_height": 24,
         "table1_icon_size": 57,
-        "table1_height": 310,
+        "table1_height": 382,
         "table1_x_offset": 0,
         
         # Table 2 (Achievements)
@@ -334,6 +335,7 @@ ICON_SCALE = 0.80
 RESOURCE_ICON_SCALE = 0.60
 KILL_ICON_SCALE = 0.8
 KILL_SOLDIER_SCALE = 0.5
+MAP_VEHICLE_OVERLAY_SCALE = 0.75  # Extra shrink for vehicle/creature/air icons on the live map overlay (not soldiers, buildings, killbar, or kill markers)
 
 # Killbar
 KILLBAR_ENTRY_HEIGHT = 24
@@ -367,7 +369,7 @@ TABLE1_DATA_FONT_SIZE = 20
 TABLE1_ROW_HEIGHT = 48
 TABLE1_HEADER_HEIGHT = 28
 TABLE1_ICON_SIZE = 34
-TABLE1_HEIGHT = 210
+TABLE1_HEIGHT = 258
 TABLE1_X_OFFSET = 0
 
 # Table 1 Column Widths (adjust these to change spacing)
@@ -507,6 +509,8 @@ TEAM_COLORS = {
     "Sol": (50, 140, 255),
     "Centauri": (235, 70, 70),
     "Alien": (70, 220, 70),
+    "Wildlife": (180, 140, 80),
+    "System": (200, 200, 100),
 }
 GRAPH_COLORS = TEAM_COLORS
 STATS_BG_COLOR = (25, 25, 25)
@@ -538,6 +542,9 @@ SCOREBOARD_ROW_HEIGHT = 28
 SCOREBOARD_TEAM_HEADER_HEIGHT = 45
 SCOREBOARD_BG_ALPHA = 220
 SCOREBOARD_MAX_PLAYERS_PER_TEAM = 25  # Max players to show per team
+
+# Detailed end-of-replay unit/structure statistics (requires SRPL)
+DETAILED_STATS_FRAMES = 2  # Number of seconds to show detailed stats (frames = this * FPS)
 
 # Resource display
 RESOURCE_FLASH_DURATION = 1.0
@@ -654,7 +661,7 @@ def set_resolution(resolution):
     """
     global VIDEO_RESOLUTION
     global MAP_SIZE, KILLBAR_WIDTH, STATS_WIDTH, VIDEO_WIDTH, VIDEO_HEIGHT
-    global ICON_SCALE, RESOURCE_ICON_SCALE, KILL_ICON_SCALE, KILL_SOLDIER_SCALE
+    global ICON_SCALE, RESOURCE_ICON_SCALE, KILL_ICON_SCALE, KILL_SOLDIER_SCALE, MAP_VEHICLE_OVERLAY_SCALE
     global KILLBAR_ENTRY_HEIGHT, KILLBAR_ICON_SIZE, KILLBAR_FONT_SIZE, KILLBAR_MAX_ENTRIES
     global KILLBAR_ICON_TO_NAME_OFFSET
     global CHAT_ENTRY_HEIGHT, CHAT_FONT_SIZE, CHAT_MAX_ENTRIES, CHAT_NAME_MAX_CHARS
@@ -688,6 +695,7 @@ def set_resolution(resolution):
     RESOURCE_ICON_SCALE = cfg["resource_icon_scale"]
     KILL_ICON_SCALE = cfg["kill_icon_scale"]
     KILL_SOLDIER_SCALE = cfg["kill_soldier_scale"]
+    MAP_VEHICLE_OVERLAY_SCALE = cfg.get("map_vehicle_overlay_scale", 0.75)
     
     # Killbar
     KILLBAR_ENTRY_HEIGHT = cfg["killbar_entry_height"]
