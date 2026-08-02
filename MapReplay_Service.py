@@ -76,11 +76,27 @@ class LiveConfig:
     # Paths (relative to Silica Dedicated Server root)
     SERVER_ROOT = Path(__file__).parent.parent.resolve()  # Go up from Mod MapReplay
     LOG_DIR = SERVER_ROOT / "UserData" / "logs"
+    SRPL_DIR = SERVER_ROOT / "UserData" / "ReplayLogs"
     ASSETS_DIR = SCRIPT_DIR / "Assets"
     MAPS_DIR = ASSETS_DIR / "Maps"
     ICONS_DIR = ASSETS_DIR / "Silica_Icons"
     OUTPUT_DIR = SCRIPT_DIR / "Replays"
-    
+
+    # Emulator sandbox (see Log_Emulator.py). While an emulation session is
+    # running the service reads these directories instead of the UserData ones,
+    # so replaying an old log never competes with - or is polluted by - the live
+    # server's own log and .srpl files.
+    EMU_ROOT = SCRIPT_DIR / "Emulator"
+    EMU_LOG_DIR = EMU_ROOT / "logs"
+    EMU_SRPL_DIR = EMU_ROOT / "ReplayLogs"
+    EMU_MARKER = EMU_ROOT / "emulation.active"
+
+    # A marker whose heartbeat is older than this is treated as abandoned (the
+    # emulator refreshes it every 5s). Generous enough to survive a stalled
+    # emulator process, short enough that a closed console window frees the
+    # service within half a minute.
+    EMU_MARKER_TIMEOUT = 30.0
+
     # Log file pattern
     LOG_PATTERN = "L*.log"  # Matches L20251214.log
     
@@ -474,9 +490,38 @@ class LogFileWatcher:
         self.file_handle: Optional[Any] = None
         self.file_position: int = 0
         self.last_check_time: float = 0
+        self.was_truncated: bool = False  # consumed by the service to reset its clock
     
+    def set_log_dir(self, log_dir: Path, from_end: bool = True) -> bool:
+        """
+        Switch to a different log directory (live <-> emulator sandbox).
+
+        Closes the current file and opens the newest one in the new directory.
+        from_end=False replays the file from the top, which is what we want when
+        switching INTO an emulation session: that log is written for us and we
+        would otherwise miss everything produced between the emulator creating
+        the file and this switch landing.
+
+        Returns True if a file in the new directory was opened.
+        """
+        log_dir = Path(log_dir)
+        if log_dir == self.log_dir:
+            return self.file_handle is not None
+
+        self.close_file()
+        self.log_dir = log_dir
+        self.logger.info(f"Log directory switched to: {log_dir}")
+
+        latest = self.get_latest_log_file()
+        if not latest:
+            self.logger.info(f"No log file in {log_dir} yet - waiting")
+            return False
+        return self.open_file(latest, from_end=from_end)
+
     def get_latest_log_file(self) -> Optional[Path]:
         """Find the most recent log file in the directory."""
+        if not self.log_dir.is_dir():
+            return None
         log_files = list(self.log_dir.glob(self.pattern))
         if not log_files:
             return None
@@ -532,10 +577,14 @@ class LogFileWatcher:
             if self.current_file and self.current_file.exists():
                 current_size = self.current_file.stat().st_size
                 if current_size < self.file_position:
-                    # File was truncated or rotated
+                    # File was truncated or rotated (the emulator's --clear-output
+                    # truncates in place). Flag it so the service can reset its
+                    # clock: the restarted file replays earlier timestamps, which
+                    # a carried-over parser mistakes for a midnight rollover.
                     self.logger.warning("Log file was truncated/rotated - reopening")
                     self.file_handle.seek(0)
                     self.file_position = 0
+                    self.was_truncated = True
             
             # Read new lines
             new_lines = self.file_handle.readlines()
@@ -1383,7 +1432,11 @@ class LiveFrameGenerator:
 
         # SRPL live reader for unit positions
         self.srpl_reader: Optional[LiveSrplReader] = None
-        self.srpl_dir = str(Path(__file__).parent.parent / "UserData" / "ReplayLogs")
+        # Re-pointed at the emulator sandbox while an emulation session runs.
+        self.srpl_dir = str(config.SRPL_DIR)
+        # SRPL files already paired with a game, so a repeated map in one
+        # emulated session does not reuse the same recording twice.
+        self._used_srpl = set()
         self._last_srpl_tick = -1  # Last SRPL tick for which frames were generated
     
     def start_game(self, game: LiveGameState):
@@ -1479,33 +1532,61 @@ class LiveFrameGenerator:
             self.logger.info(f"SRPL dir not found: {self.srpl_dir}")
             return
 
-        # Find the most recent .srpl file for this map
-        # During a live game, the file was just created moments ago
-        best_path = None
-        best_mtime = 0
+        # Find the .srpl for this map.
+        #
+        # Live: the newest one, since it was created moments ago.
+        #
+        # Emulated: the OLDEST EMU_ file for this map that we have not already
+        # consumed. All of a session's EMU_ files now stay on disk until the next
+        # run sweeps them, so if a map is played twice in one emulated log,
+        # "newest" would hand both games the second recording. Games arrive in
+        # chronological order, so oldest-unused is the right pairing.
+        # EMU_ handling applies ONLY while reading the emulator sandbox. Gating on
+        # the directory rather than the filename matters: leftover EMU_ files can
+        # sit in the server's real UserData/ReplayLogs from older emulator runs,
+        # and treating those as session files would let a live game adopt a
+        # months-old recording for its map instead of the one just written.
+        in_sandbox = os.path.normpath(self.srpl_dir) == os.path.normpath(str(self.config.EMU_SRPL_DIR))
+
+        candidates = []
         for fname in os.listdir(self.srpl_dir):
             if not fname.endswith(".srpl"):
                 continue
             if game.map_name and game.map_name not in fname:
                 continue
             fpath = os.path.join(self.srpl_dir, fname)
-            mtime = os.path.getmtime(fpath)
-            if mtime > best_mtime:
-                best_mtime = mtime
-                best_path = fpath
+            is_emu = in_sandbox and fname.startswith("EMU_")
+            candidates.append((os.path.getmtime(fpath), fpath, is_emu))
+
+        emu_unused = sorted(c for c in candidates if c[2] and c[1] not in self._used_srpl)
+        if emu_unused:
+            best_mtime, best_path, _ = emu_unused[0]
+        elif candidates:
+            best_mtime, best_path, _ = max(candidates)
+        else:
+            best_mtime, best_path = 0, None
 
         if not best_path:
             self.logger.info(f"No SRPL file found for map {game.map_name}")
             return
 
-        # Only use if recently created (within last 120 seconds)
-        if time.time() - best_mtime > 120:
+        # Only use if recently created (within last 120 seconds).
+        #
+        # That check exists to stop a live server picking up a historical .srpl.
+        # It must not apply to an emulated stream: the emulator races ahead at
+        # its speed multiplier while rendering runs far slower, so by the time
+        # the service reaches a later game's Round_Start that game's EMU_ file is
+        # legitimately many minutes old. The emulation marker plus the EMU_
+        # prefix already prove the file belongs to this session.
+        is_emulated = os.path.basename(best_path).startswith("EMU_")
+        if not is_emulated and time.time() - best_mtime > 120:
             self.logger.info(f"SRPL file too old ({time.time() - best_mtime:.0f}s), skipping")
             return
 
         reader = LiveSrplReader(best_path)
         if reader.open():
             self.srpl_reader = reader
+            self._used_srpl.add(best_path)
             self.logger.info(f"SRPL live reader opened: {best_path}")
             # Compute time offset: SRPL t=0 is true game start (Unix timestamp in header).
             # Log-derived game.start_time is absolute log timer (seconds since server start),
@@ -1514,8 +1595,32 @@ class LiveFrameGenerator:
             # offset = (log_start_unix - srpl_start_unix)
             # A positive offset means the log detected the game late; we shift SRPL forward.
             srpl_start_unix = reader.replay.start_timestamp
-            if srpl_start_unix > 0 and hasattr(game, '_start_unix') and game._start_unix > 0:
+            if os.path.basename(best_path).startswith("EMU_"):
+                # Emulated stream. The emulator writes the SRPL header at the
+                # instant it emits Round_Start, so SRPL tick 0 IS log game time
+                # 0 by construction - the alignment is already exact and needs
+                # no correction.
+                #
+                # Wall clock must NOT be used here. Both timestamps below are
+                # real time, but under fast playback the service reads that
+                # Round_Start seconds to minutes after the emulator wrote it
+                # (rendering lags far behind a 50x emitter). That lag would be
+                # applied as a time shift, pushing every position lookup past
+                # the end of the recording and leaving the map with no units.
+                reader.replay.time_offset = 0.0
+                self.logger.info(
+                    "SRPL time offset: 0.0s (emulated stream - aligned at Round_Start)"
+                )
+            elif srpl_start_unix > 0 and hasattr(game, '_start_unix') and game._start_unix > 0:
                 offset = game._start_unix - srpl_start_unix
+                if offset < 0:
+                    # SRPL started after the log's game start. Clamping to 0 is
+                    # the safe read, but it means the two clocks disagree, so
+                    # say so instead of hiding it.
+                    self.logger.warning(
+                        f"SRPL starts {-offset:.1f}s after the log's game start - "
+                        f"clamping offset to 0; positions may be misaligned"
+                    )
                 reader.replay.time_offset = max(0.0, offset)
                 self.logger.info(f"SRPL time offset: {offset:.1f}s (log started {offset:.1f}s after SRPL)")
             else:
@@ -1952,11 +2057,98 @@ class MapReplayService:
         self.discord_uploader = DiscordUploader(config, self.logger)
         
         self.running = False
+        self._emu_mode = False           # currently reading the emulator sandbox?
+        self._emu_stale_logged = False   # avoid spamming the stale-marker warning
+        self._emu_drain_logged = False   # avoid spamming the drain notice
         self.stats = {
             "lines_processed": 0,
             "games_completed": 0,
             "errors": 0,
         }
+
+    def _emulation_active(self) -> bool:
+        """
+        True while a Log_Emulator.py session is running.
+
+        Detected through the heartbeat marker the emulator maintains rather than
+        by scanning for a running Run_Emulator.bat. The marker also covers
+        Log_Emulator.py launched directly (shell, IDE, another script), which the
+        .bat check would miss, and a stale heartbeat releases the service when
+        the emulator was killed without cleaning up after itself.
+        """
+        try:
+            age = time.time() - self.config.EMU_MARKER.stat().st_mtime
+        except OSError:
+            self._emu_stale_logged = False
+            return False
+
+        if age > self.config.EMU_MARKER_TIMEOUT:
+            if not self._emu_stale_logged:
+                self.logger.warning(
+                    f"Emulation marker is stale ({age:.0f}s since last heartbeat) - "
+                    f"ignoring it and watching the live server log"
+                )
+                self._emu_stale_logged = True
+            return False
+
+        self._emu_stale_logged = False
+        return True
+
+    def _emulated_log_has_unread(self) -> bool:
+        """True if the log we are following still has bytes we have not read."""
+        watcher = self.log_watcher
+        if not watcher.file_handle or not watcher.current_file:
+            return False
+        try:
+            return watcher.current_file.stat().st_size > watcher.file_position
+        except OSError:
+            return False
+
+    def _sync_emulation_mode(self):
+        """Point the log/SRPL watchers at the emulator sandbox or the live dirs."""
+        active = self._emulation_active()
+        if active == self._emu_mode:
+            return
+
+        # The emulator writes far faster than we render, so when it exits there
+        # is normally a backlog left in the emulated log - including the
+        # Round_Win that finalizes the video. Switching away on the spot would
+        # discard it, so drain the file first and leave on a later iteration.
+        if not active and self._emulated_log_has_unread():
+            if not self._emu_drain_logged:
+                self.logger.info(
+                    "Emulator finished - draining the remaining emulated log "
+                    "before returning to the live server log"
+                )
+                self._emu_drain_logged = True
+            return
+
+        self._emu_drain_logged = False
+        self._emu_mode = active
+
+        # Switching streams means the timeline restarts, so drop the parser's
+        # carried-over clock. Without this the emulated log (starting at, say,
+        # 18:25) looks like it jumped backwards from wherever the live log had
+        # got to, the parser calls it a midnight rollover and adds 86400s to
+        # every game time - which then desynchronises the SRPL lookup and leaves
+        # the map with no units at all.
+        self.parser.last_raw_time = None
+        self.parser.time_offset = 0
+        self.parser.current_game = None
+        self.frame_generator.srpl_reader = None
+        self.frame_generator._last_srpl_tick = -1
+        if active:
+            self.logger.info("=== EMULATION SESSION DETECTED ===")
+            self.logger.info(f"Reading emulated log from:  {self.config.EMU_LOG_DIR}")
+            self.logger.info(f"Reading emulated SRPL from: {self.config.EMU_SRPL_DIR}")
+            self.frame_generator.srpl_dir = str(self.config.EMU_SRPL_DIR)
+            # from_end=False: the emulated log is written for us, so read it whole
+            # rather than skipping whatever landed before this switch.
+            self.log_watcher.set_log_dir(self.config.EMU_LOG_DIR, from_end=False)
+        else:
+            self.logger.info("=== EMULATION SESSION ENDED - resuming live server log ===")
+            self.frame_generator.srpl_dir = str(self.config.SRPL_DIR)
+            self.log_watcher.set_log_dir(self.config.LOG_DIR, from_end=True)
     
     def _handle_game_completion(self, result_info: dict) -> bool:
         """
@@ -2034,14 +2226,19 @@ class MapReplayService:
         # Set CPU affinity
         self.cpu_manager.set_affinity()
         
+        # Attach to the emulator sandbox if a session is already running, so we
+        # do not briefly latch onto the live log only to switch a moment later
+        self._sync_emulation_mode()
+
         # Find and open the latest log file
-        latest_log = self.log_watcher.get_latest_log_file()
-        if latest_log:
-            self.log_watcher.open_file(latest_log, from_end=True)
-            self.logger.info(f"Monitoring log file: {latest_log}")
-        else:
-            self.logger.warning(f"No log files found in {self.config.LOG_DIR}")
-            self.logger.info("Waiting for log files...")
+        if not self.log_watcher.file_handle:
+            latest_log = self.log_watcher.get_latest_log_file()
+            if latest_log:
+                self.log_watcher.open_file(latest_log, from_end=True)
+                self.logger.info(f"Monitoring log file: {latest_log}")
+            else:
+                self.logger.warning(f"No log files found in {self.log_watcher.log_dir}")
+                self.logger.info("Waiting for log files...")
         
         self.running = True
         self.logger.info("Service started - monitoring for games...")
@@ -2059,6 +2256,9 @@ class MapReplayService:
         self._last_line_time = time.time()  # Track last log line for timeout
         
         while self.running:
+            # Follow the emulator in/out of its sandbox before touching the log
+            self._sync_emulation_mode()
+
             # Check for new log file (midnight rollover)
             self.log_watcher.check_for_new_file()
             
@@ -2066,13 +2266,26 @@ class MapReplayService:
             if not self.log_watcher.file_handle:
                 latest = self.log_watcher.get_latest_log_file()
                 if latest:
-                    self.log_watcher.open_file(latest, from_end=True)
+                    # In emulation mode the log appears only once the emulator
+                    # creates it, so read it from the top - seeking to the end
+                    # here would drop every line written before we noticed it.
+                    self.log_watcher.open_file(latest, from_end=not self._emu_mode)
                 else:
                     time.sleep(self.config.POLL_INTERVAL)
                     continue
             
             # Read new lines
             new_lines = self.log_watcher.read_new_lines()
+
+            # A truncated log restarts its timeline; forget the old clock/game
+            if self.log_watcher.was_truncated:
+                self.log_watcher.was_truncated = False
+                self.logger.info("Log restarted - resetting parser clock and current game")
+                self.parser.last_raw_time = None
+                self.parser.time_offset = 0
+                self.parser.current_game = None
+                self.frame_generator.srpl_reader = None
+                self.frame_generator._last_srpl_tick = -1
             
             for line in new_lines:
                 # Check for log file closed

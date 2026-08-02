@@ -7,6 +7,9 @@ python_config.bat
 # Generated replays
 Replays/
 
+# Log emulator sandbox (emulated logs, streamed .srpl copies, session marker)
+Emulator/
+
 # Log files
 *.log
 

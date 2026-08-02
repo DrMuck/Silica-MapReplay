@@ -37,6 +37,8 @@ import os
 import sys
 import re
 import time
+import json
+import struct
 import argparse
 import threading
 from pathlib import Path
@@ -51,18 +53,129 @@ from typing import Optional, List, Tuple
 class EmulatorConfig:
     """Configuration for the log emulator."""
     
-    # Default output directory (same as MapReplay_Live expects)
-    # This should point to: SilicaDedicatedServer/UserData/logs/
-    DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "UserData" / "logs"
-    
+    # Emulator sandbox. Everything the emulator produces lives under here so it
+    # never writes into - or clears - the real server's UserData directories.
+    # MapReplay_Service switches its watchers to these paths while an emulation
+    # session is running (see EmulationMarker below).
+    EMU_ROOT = Path(__file__).parent / "Emulator"
+
+    # Default output directory for the emulated game log (L<date>.log).
+    DEFAULT_OUTPUT_DIR = EMU_ROOT / "logs"
+
+    # Read-only pool of the game's real .srpl replays. The emulator looks up the
+    # recording that matches each replayed game here, but never writes to it.
+    DEFAULT_SRPL_SRC_DIR = Path(__file__).parent.parent / "UserData" / "ReplayLogs"
+
+    # Directory the emulator streams its matching .srpl copy into (unit
+    # positions), mirroring the layout of UserData/ReplayLogs.
+    DEFAULT_SRPL_DIR = EMU_ROOT / "ReplayLogs"
+
+    # Marker file that tells the live service an emulation session is active.
+    # Its mtime is refreshed periodically as a heartbeat.
+    EMU_MARKER = EMU_ROOT / "emulation.active"
+
+    # How often the marker's heartbeat is refreshed, in seconds. The service
+    # uses a timeout several times this value before declaring it stale.
+    HEARTBEAT_INTERVAL = 5.0
+
+    # How close (seconds) an .srpl file's start time must be to a game's
+    # Round_Start to be considered the match for that game.
+    SRPL_MATCH_TOLERANCE = 180
+
+    # Prefix for the emulator's streamed copy so it is easy to identify/clean up
+    # and never clobbers a real replay.
+    SRPL_EMU_PREFIX = "EMU_"
+
     # Default playback speed multiplier
     DEFAULT_SPEED = 10.0
-    
+
     # Minimum delay between lines (even at max speed)
     MIN_LINE_DELAY = 0.001  # 1ms minimum
-    
+
     # Batch size for writing lines with same timestamp
     BATCH_SAME_TIMESTAMP = True
+
+
+# ============================================================
+# EMULATION MARKER
+# ============================================================
+
+class EmulationMarker:
+    """
+    Announces a running emulation session to MapReplay_Service.
+
+    While the marker exists the service reads the emulated log/SRPL directories
+    instead of the real UserData ones. The file's mtime doubles as a heartbeat:
+    a background thread touches it every HEARTBEAT_INTERVAL seconds and the
+    service ignores a marker that has gone stale. That way an emulator killed
+    the hard way - console window closed, machine reset, no clean shutdown -
+    releases the service on its own instead of pinning it to a dead session.
+
+    Detecting the session by marker rather than by scanning for a running
+    Run_Emulator.bat also keeps it working when Log_Emulator.py is started
+    directly (from a shell, an IDE, or another script), which is how it is
+    usually run during development.
+    """
+
+    def __init__(self, marker_path: Path, log_dir: Path, srpl_dir: Path,
+                 source_log: Path, speed: float,
+                 interval: float = EmulatorConfig.HEARTBEAT_INTERVAL):
+        self.marker_path = Path(marker_path)
+        self.log_dir = Path(log_dir)
+        self.srpl_dir = Path(srpl_dir)
+        self.source_log = Path(source_log)
+        self.speed = speed
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _payload(self) -> str:
+        return json.dumps({
+            "pid": os.getpid(),
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "heartbeat": datetime.now().isoformat(timespec="seconds"),
+            "log_dir": str(self.log_dir),
+            "srpl_dir": str(self.srpl_dir),
+            "source_log": str(self.source_log),
+            "speed": self.speed,
+        }, indent=2)
+
+    def _write(self):
+        tmp = self.marker_path.with_suffix(self.marker_path.suffix + ".tmp")
+        tmp.write_text(self._payload(), encoding="utf-8")
+        # Atomic replace so the service never reads a half-written marker.
+        os.replace(tmp, self.marker_path)
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._write()
+            except Exception as e:
+                print(f"[EMU MARKER] Heartbeat failed: {e}")
+
+    def start(self):
+        self.marker_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._write()
+        except Exception as e:
+            print(f"[EMU MARKER] Could not create marker {self.marker_path}: {e}")
+            print("[EMU MARKER] The live service will keep watching the real server log.")
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print(f"Emulation marker: {self.marker_path}")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        try:
+            self.marker_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[EMU MARKER] Could not remove marker: {e}")
 
 
 # ============================================================
@@ -119,35 +232,328 @@ class TimeParser:
 
 
 # ============================================================
+# SRPL STREAMER
+# ============================================================
+#
+# The live MapReplay service overlays unit movement (and AI-vs-AI kill /
+# harvester / detailed-unit stats) from the game's native .srpl replay, which
+# it reads from UserData/ReplayLogs. It only accepts an .srpl whose mtime is
+# within ~120s and whose data grows over time (frame generation is driven by
+# new SRPL ticks). Historical .srpl files are always "too old", so replaying a
+# log alone produces videos with NO unit movement.
+#
+# The streamer fixes this: for each game the emulator replays, it locates the
+# matching .srpl, rewrites its header start-timestamp to "now" (so the service
+# computes a ~0 time offset), and dribbles its records into
+# ReplayLogs/EMU_<name>.srpl paced by the SAME speed multiplier as the log — so
+# SRPL tick T becomes visible exactly when the emulated log reaches game-time T.
+
+# SRPL filename pattern: YYYYMMDD_HHMMSS_MapName.srpl
+SRPL_NAME_RE = re.compile(r'^(\d{8})_(\d{6})_(.+)\.srpl$', re.IGNORECASE)
+
+
+def _read_srpl_string(data: bytes, off: int) -> Tuple[str, int]:
+    """Read a uint8-length-prefixed UTF-8 string from a bytes buffer."""
+    n = data[off]
+    off += 1
+    s = data[off:off + n].decode("utf-8", errors="replace")
+    return s, off + n
+
+
+def load_srpl_records(path: Path):
+    """
+    Read an .srpl file and split it into individually-releasable records, each
+    tagged with the game-time (seconds) at which it should become visible.
+
+    Registration/setup records (before the first TickFrame) and header release
+    at t=0. Each TickFrame and later interleaved record releases at the game
+    time of the most-recently-seen tick, mirroring how the game wrote it live.
+
+    Returns (header_bytes, records) where header_bytes is the full header and
+    records is a list of (release_seconds, raw_record_bytes). Raises ValueError
+    on a bad file.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if data[:4] != b"SRPL":
+        raise ValueError("Bad SRPL magic")
+
+    off = 4
+    version = data[off]; off += 1
+    tick_interval_ms = struct.unpack_from("<H", data, off)[0]; off += 2
+    _map, off = _read_srpl_string(data, off)   # map_name
+    _gt, off = _read_srpl_string(data, off)    # game_type
+    off += 8                                    # start_timestamp (int64)
+    header = data[:off]
+
+    def t2s(tick: int) -> float:
+        return tick * tick_interval_ms / 1000.0
+
+    records: List[Tuple[float, bytes]] = []
+    cur_tick = 0
+    n = len(data)
+
+    while off < n:
+        rstart = off
+        rt = data[off]; off += 1
+
+        if rt == 0xFF:                                    # EndOfReplay
+            records.append((t2s(cur_tick), data[rstart:off]))
+            break
+        elif rt == 0x01:                                  # TypeRegister
+            off += 1                                      # type_id
+            slen = data[off]; off += 1 + slen
+        elif rt == 0x02:                                  # EntityRegister
+            off += 6 if version >= 2 else 5               # eid,team,tid,is_unit[,ctrl]
+            off += 4                                       # reg_x, reg_y
+            if version >= 3:
+                off += 2                                   # z
+        elif rt == 0x03:                                  # PlayerRegister
+            off += 2                                       # pid, team
+            slen = data[off]; off += 1 + slen
+        elif rt == 0x04:                                  # PlayerControl
+            off += 5
+        elif rt == 0x10:                                  # TickFrame
+            tick, count = struct.unpack_from("<HH", data, off); off += 4
+            cur_tick = tick
+            off += count * (8 if version >= 3 else 6)
+        elif rt in (0x20, 0x30):                          # Unit/Building destroyed
+            off += 6
+        else:
+            # Unknown record: stop cleanly, keep what we have.
+            break
+
+        records.append((t2s(cur_tick), data[rstart:off]))
+
+    return header, records
+
+
+def find_matching_srpl(srpl_dir: Path, map_name: str, game_dt: datetime,
+                       tolerance_s: int) -> Optional[Path]:
+    """
+    Find the .srpl whose filename timestamp is closest to a game's Round_Start.
+
+    Matches by map name and a start time within `tolerance_s`. Ignores the
+    emulator's own EMU_ copies. Returns the path or None.
+    """
+    if not srpl_dir.is_dir() or not map_name:
+        return None
+
+    best_path = None
+    best_delta = float("inf")
+    for fname in os.listdir(srpl_dir):
+        if fname.startswith(EmulatorConfig.SRPL_EMU_PREFIX):
+            continue
+        m = SRPL_NAME_RE.match(fname)
+        if not m:
+            continue
+        if m.group(3).lower() != map_name.lower():
+            continue
+        try:
+            f_dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        delta = abs((f_dt - game_dt).total_seconds())
+        if delta < best_delta:
+            best_delta = delta
+            best_path = srpl_dir / fname
+
+    if best_path is not None and best_delta <= tolerance_s:
+        return best_path
+    return None
+
+
+class SrplStreamer:
+    """
+    Streams a matching .srpl into the ReplayLogs dir, paced to a shared speed.
+
+    One streamer instance is reused across games; start() switches to a new
+    source .srpl (stopping any previous stream first). Pacing mirrors the log
+    emulator's own loop so log and SRPL stay in lock-step even when the speed
+    is changed live.
+    """
+
+    def __init__(self, srpl_dir: Path, get_speed):
+        self.srpl_dir = Path(srpl_dir)
+        self.get_speed = get_speed          # callable -> current speed multiplier
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._drain = threading.Event()   # write the remainder without pacing
+        self._dst_path: Optional[Path] = None
+
+    def start(self, src_path: Path, map_name: str):
+        """Begin streaming src_path. Stops any previous stream first."""
+        self.stop()
+        try:
+            header, records = load_srpl_records(src_path)
+        except Exception as e:
+            print(f"  [SRPL] Failed to read {src_path.name}: {e}")
+            return False
+
+        # Rewrite the 8-byte header start_timestamp to "now" so the service
+        # computes a near-zero time offset (game._start_unix is time.time()).
+        new_header = header[:-8] + struct.pack("<q", int(time.time()))
+
+        self._dst_path = self.srpl_dir / (EmulatorConfig.SRPL_EMU_PREFIX + src_path.name)
+        try:
+            self.srpl_dir.mkdir(parents=True, exist_ok=True)
+            # Write header synchronously so the file exists the instant the
+            # service processes the same Round_Start line.
+            with open(self._dst_path, "wb") as out:
+                out.write(new_header)
+                out.flush()
+        except Exception as e:
+            print(f"  [SRPL] Failed to create {self._dst_path}: {e}")
+            self._dst_path = None
+            return False
+
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(records,), daemon=True
+        )
+        self._thread.start()
+        dur = records[-1][0] if records else 0.0
+        print(f"  [SRPL] Streaming {src_path.name} -> {self._dst_path.name} "
+              f"({len(records)} records, {dur/60:.1f} min)")
+        return True
+
+    def _run(self, records: List[Tuple[float, bytes]]):
+        """Append records to the dst file, paced by release time / speed."""
+        dst = self._dst_path
+        last_rel = 0.0
+        last_real = time.time()
+        try:
+            out = open(dst, "ab")
+        except Exception as e:
+            print(f"  [SRPL] Cannot open {dst} for append: {e}")
+            return
+        try:
+            for rel, raw in records:
+                if self._stop.is_set():
+                    break
+                delta = rel - last_rel
+                # _drain skips pacing so the tail is written as fast as the disk
+                # allows; the service only cares that the records arrive.
+                if delta > 0 and not self._drain.is_set():
+                    speed = max(self.get_speed(), 0.001)
+                    target = last_real + delta / speed
+                    while not self._stop.is_set() and not self._drain.is_set():
+                        remaining = target - time.time()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(remaining, 0.2))
+                last_rel = rel
+                last_real = time.time()
+                out.write(raw)
+                out.flush()
+        finally:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+    def finish(self, timeout: float = 30.0):
+        """
+        Let the current stream write out whatever is left, unpaced.
+
+        Called on Round_Win. The streamer paces itself off the same speed
+        multiplier as the log, but it also has to write and flush every record,
+        so at high speeds it runs slightly behind the log emitter - at 50x it
+        was ~750 ticks (2.5 min of game) short when the round ended. Cutting it
+        off there truncates the .srpl, and because the service drives frame
+        generation off SRPL ticks, the replay simply freezes at that point.
+        Draining first costs a moment and keeps the recording complete.
+        """
+        if self._thread and self._thread.is_alive():
+            self._drain.set()
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                print("  [SRPL] Stream did not drain in time; stopping it")
+        self._thread = None
+        self._drain.clear()
+
+    def stop(self):
+        """
+        Stop the current stream. The written file is deliberately KEPT.
+
+        It used to be deleted here, which broke every game after the first in a
+        multi-game run: the emulator races ahead at the configured speed while
+        the service renders far slower, so by the time the service reached game
+        2's Round_Start that game's .srpl had already been unlinked when game 3
+        started. Only game 1 survived, and only by accident - Windows refuses to
+        unlink a file the service still holds open.
+
+        Leftovers are cleaned by sweep_stale() at the start of the next run, so
+        nothing accumulates across sessions.
+        """
+        if self._thread and self._thread.is_alive():
+            self._stop.set()
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._dst_path = None
+
+    def sweep_stale(self):
+        """Remove leftover EMU_ files from previous runs (best effort)."""
+        if not self.srpl_dir.is_dir():
+            return
+        for fname in os.listdir(self.srpl_dir):
+            if fname.startswith(EmulatorConfig.SRPL_EMU_PREFIX):
+                try:
+                    (self.srpl_dir / fname).unlink()
+                except Exception:
+                    pass
+
+
+# ============================================================
 # LOG EMULATOR
 # ============================================================
 
 class LogEmulator:
     """Emulates a live game server by replaying historical logs."""
     
-    def __init__(self, input_path: Path, output_dir: Path, speed: float = 10.0):
+    def __init__(self, input_path: Path, output_dir: Path, speed: float = 10.0,
+                 srpl_dir: Optional[Path] = None, enable_srpl: bool = True,
+                 srpl_out_dir: Optional[Path] = None):
         self.input_path = input_path
         self.output_dir = output_dir
         self.speed = speed
-        
+
         self.lines: List[str] = []
         self.timestamps: List[Optional[float]] = []
-        
+
         self.running = False
         self.paused = False
         self.current_line = 0
         self.lines_written = 0
-        
+
         # Statistics
         self.start_time: Optional[float] = None
         self.log_start_time: Optional[float] = None
-        
+
         # Output file
         self.output_file = None
         self.output_path: Optional[Path] = None
-        
+
         # Speed control thread
         self.control_thread: Optional[threading.Thread] = None
+
+        # Session marker for the live service (created in run())
+        self.marker: Optional[EmulationMarker] = None
+
+        # SRPL streaming (feeds unit positions to the live service).
+        # Source and destination are deliberately different directories: the
+        # source is the server's real ReplayLogs (read-only), the destination is
+        # the emulator sandbox. Sharing one directory made the streamer sweep
+        # and write EMU_ files into the server's own replay folder.
+        self.enable_srpl = enable_srpl
+        self.srpl_dir = Path(srpl_dir) if srpl_dir else EmulatorConfig.DEFAULT_SRPL_SRC_DIR
+        self.srpl_out_dir = Path(srpl_out_dir) if srpl_out_dir else EmulatorConfig.DEFAULT_SRPL_DIR
+        self.srpl_streamer: Optional[SrplStreamer] = None
+        self._srpl_current_map = "Unknown"   # last "Loading map" seen while emitting
+        self._srpl_re_loading = re.compile(r'Loading map "([^"]+)"')
+        self._srpl_re_round_start = re.compile(r'World triggered "Round_Start"')
+        self._srpl_re_round_win = re.compile(r'World triggered "Round_Win"')
     
     def load_log(self, start_line: int = 0) -> bool:
         """Load the input log file."""
@@ -160,8 +566,32 @@ class LogEmulator:
             print(f"Error loading log file: {e}")
             return False
         
+        # Seed the current map from the lines we are about to skip.
+        #
+        # The SRPL streamer normally learns the map from 'Loading map "X"' lines
+        # as it emits them, but the game selector starts a slice at
+        # round_start_line - 50 whenever the map load was more than 100 lines
+        # back. Those slices contain no 'Loading map' line, so the map stayed
+        # "Unknown" and the .srpl lookup - which filters on map name - silently
+        # found nothing. Reading the history first makes the lookup work no
+        # matter where the slice begins.
+        # Line numbers from find_games_in_log()/--select-game are 1-based, so the
+        # slice has to start one earlier. Using them directly as a 0-based index
+        # dropped the very first line of the slice - which is the 'Loading map'
+        # line the selector deliberately started at, leaving the live service
+        # with Map: Unknown and no frames at all.
+        skip = max(0, start_line - 1)
+
+        if skip > 0:
+            for line in reversed(all_lines[:skip]):
+                m = self._srpl_re_loading.search(line)
+                if m:
+                    self._srpl_current_map = m.group(1)
+                    print(f"Map from log history: {self._srpl_current_map}")
+                    break
+
         # Skip to start line
-        all_lines = all_lines[start_line:]
+        all_lines = all_lines[skip:]
         
         # Parse timestamps for all lines
         self.lines = []
@@ -238,7 +668,45 @@ class LogEmulator:
             self.output_file.write(line + '\n')
             self.output_file.flush()  # Ensure immediate write
             self.lines_written += 1
-    
+
+    def _srpl_on_line(self, line: str):
+        """
+        Drive the SRPL streamer off the log lines as they are emitted so the
+        streamed .srpl stays in lock-step with the log.
+
+        - "Loading map" updates the current map.
+        - "Round_Start" starts streaming the matching .srpl (anchored to now).
+        - "Round_Win" stops the current stream.
+        """
+        if not self.srpl_streamer:
+            return
+
+        m = self._srpl_re_loading.search(line)
+        if m:
+            self._srpl_current_map = m.group(1)
+            return
+
+        if self._srpl_re_round_start.search(line):
+            game_dt = TimeParser.parse_date(line)  # full date+time from the line
+            if game_dt is None:
+                print("  [SRPL] Round_Start without a parseable date; skipping SRPL")
+                return
+            src = find_matching_srpl(
+                self.srpl_dir, self._srpl_current_map, game_dt,
+                EmulatorConfig.SRPL_MATCH_TOLERANCE,
+            )
+            if src is None:
+                print(f"  [SRPL] No matching .srpl for {self._srpl_current_map} "
+                      f"@ {game_dt:%H:%M:%S} (within "
+                      f"{EmulatorConfig.SRPL_MATCH_TOLERANCE}s)")
+            else:
+                self.srpl_streamer.start(src, self._srpl_current_map)
+            return
+
+        if self._srpl_re_round_win.search(line):
+            # Drain rather than cut: see SrplStreamer.finish()
+            self.srpl_streamer.finish()
+
     def start_control_thread(self):
         """Start the keyboard control thread."""
         def control_loop():
@@ -328,7 +796,26 @@ class LogEmulator:
         
         # Start control thread
         self.start_control_thread()
-        
+
+        # Announce the session so the live service switches to the emulator dirs
+        self.marker = EmulationMarker(
+            EmulatorConfig.EMU_MARKER,
+            self.output_dir,
+            self.srpl_dir,
+            self.input_path,
+            self.speed,
+        )
+        self.marker.start()
+
+        # Prepare SRPL streaming (feeds unit positions to the live service)
+        if self.enable_srpl:
+            self.srpl_streamer = SrplStreamer(self.srpl_out_dir, lambda: self.speed)
+            self.srpl_streamer.sweep_stale()
+            print(f"SRPL source: {self.srpl_dir}")
+            print(f"SRPL stream out: {self.srpl_out_dir}")
+        else:
+            print("SRPL streaming disabled (--no-srpl)")
+
         print(f"\nStarting playback at {self.speed}x speed...")
         print("Press 's' for status, 'q' to quit\n")
         
@@ -370,6 +857,9 @@ class LogEmulator:
                 
                 # Write the line
                 self.write_line(line)
+                # Drive SRPL streaming off the same line stream
+                if self.srpl_streamer:
+                    self._srpl_on_line(line)
                 self.current_line += 1
                 
                 # Progress indicator every 1000 lines
@@ -387,7 +877,11 @@ class LogEmulator:
         finally:
             self.running = False
             self.close_output_file()
-        
+            if self.srpl_streamer:
+                self.srpl_streamer.stop()
+            if self.marker:
+                self.marker.stop()
+
         return True
 
 
@@ -618,7 +1112,20 @@ During playback:
         action="store_true",
         help="Clear existing output log file before starting"
     )
-    
+
+    parser.add_argument(
+        "--no-srpl",
+        action="store_true",
+        help="Do NOT stream a matching .srpl (replays will lack unit movement)"
+    )
+
+    parser.add_argument(
+        "--srpl-dir",
+        type=Path,
+        default=None,
+        help="Directory holding .srpl replays (default: ../UserData/ReplayLogs/)"
+    )
+
     args = parser.parse_args()
     
     # Validate input file
@@ -634,9 +1141,16 @@ During playback:
     print("=" * 60)
     print("  Log Emulator for MapReplay Live Testing")
     print("=" * 60)
+    # Source pool of real recordings to look matches up in - NOT the sandbox the
+    # emulator streams into (EmulatorConfig.DEFAULT_SRPL_DIR).
+    srpl_dir = args.srpl_dir if args.srpl_dir else EmulatorConfig.DEFAULT_SRPL_SRC_DIR
+    srpl_out_dir = EmulatorConfig.DEFAULT_SRPL_DIR
+
     print(f"Input:  {args.input_log}")
     print(f"Output: {output_dir}")
     print(f"Speed:  {args.speed}x")
+    print(f"SRPL:   {'disabled' if args.no_srpl else f'{srpl_dir} -> {srpl_out_dir}'}")
+    print(f"Marker: {EmulatorConfig.EMU_MARKER}")
     print()
     
     # Game selection
@@ -651,18 +1165,31 @@ During playback:
     if start_line > 0:
         print(f"Starting from line: {start_line}")
     
-    # Clear output if requested
+    # Clear output if requested.
+    #
+    # Truncate rather than unlink: a MapReplay service that is already following
+    # this file holds an open handle on it, and Windows refuses to delete an open
+    # file. Truncating works regardless, and the service's watcher already
+    # detects a shrunken file and rewinds to the start.
     if args.clear_output:
         output_file = output_dir / f"L{datetime.now().strftime('%Y%m%d')}.log"
         if output_file.exists():
-            output_file.unlink()
-            print(f"Cleared: {output_file}")
+            try:
+                with open(output_file, "w", encoding="utf-8"):
+                    pass
+                print(f"Cleared: {output_file}")
+            except Exception as e:
+                print(f"Could not clear {output_file}: {e}")
+                sys.exit(1)
     
     # Create and run emulator
     emulator = LogEmulator(
         input_path=args.input_log,
         output_dir=output_dir,
-        speed=args.speed
+        speed=args.speed,
+        srpl_dir=srpl_dir,
+        srpl_out_dir=srpl_out_dir,
+        enable_srpl=not args.no_srpl,
     )
     
     if not emulator.load_log(start_line):
