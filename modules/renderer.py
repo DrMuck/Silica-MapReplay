@@ -163,13 +163,15 @@ class KillbarScrollBuffer:
             self.width = width
             self.height = height
         
-        # FAST PATH: Check if any new kills since last check
-        # Count non-structure kills up to current_time
+        # FAST PATH: Check if any new kills since last check.
+        # Count every kill up to current_time - structure kills included, because
+        # _filter_kills_for_killbar() displays them too. Counting only non-structure
+        # kills made the counter stay at 0 for logs that contain no unit kills, so
+        # the cached (empty) buffer was returned for the whole replay.
         current_kill_count = 0
         for k in kills:
             if k.time <= current_time:
-                if not k.is_structure:
-                    current_kill_count += 1
+                current_kill_count += 1
             else:
                 break
 
@@ -179,7 +181,7 @@ class KillbarScrollBuffer:
             return self.buffer_image
 
         # New kills detected - need to process
-        # Get current kills (sorted by time, most recent first), excluding structures
+        # Get current kills (sorted by time, most recent first), structures included
         recent_kills = _filter_kills_for_killbar(kills, current_time)[:self.max_entries]
         current_kill_ids = [k.kill_number for k in recent_kills]
         
