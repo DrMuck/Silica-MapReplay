@@ -10,6 +10,10 @@ Replays/
 # Log emulator sandbox (emulated logs, streamed .srpl copies, session marker)
 Emulator/
 
+# Single-instance run lock
+mapreplay_service.lock
+mapreplay_service.pid
+
 # Log files
 *.log
 

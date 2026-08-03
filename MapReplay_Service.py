@@ -2043,6 +2043,96 @@ class LiveFrameGenerator:
 # MAIN SERVICE
 # ============================================================
 
+class SingleInstanceLock:
+    """
+    Exclusive run-lock so only one service renders at a time.
+
+    Uses an OS-level lock on an open file handle rather than a PID file. The
+    operating system releases it when the process dies for any reason, so a
+    service killed with the terminal window - which is exactly how the stale
+    instance survived - leaves nothing behind to clean up. A plain PID file
+    would need liveness checks, and on Windows os.kill(pid, 0) terminates the
+    target rather than probing it.
+
+    The PID is still written into the file, purely so the error message can name
+    the holder.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        # The PID lives in a sibling file, never in the locked one. On Windows
+        # msvcrt.locking() locks a byte at the current file position, so writing
+        # to the byte we just locked fails with PermissionError in our own
+        # process - and the second instance would die on that write instead of
+        # reporting the conflict.
+        self.pid_path = self.path.with_suffix(".pid")
+        self.holder_pid: Optional[str] = None
+        self._handle = None
+
+    def acquire(self) -> bool:
+        try:
+            self.holder_pid = self.pid_path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            self.holder_pid = None
+
+        try:
+            # One byte to lock. Only ever created, never rewritten, so an
+            # instance holding the lock is never disturbed by a later arrival.
+            if not self.path.exists() or self.path.stat().st_size == 0:
+                with open(self.path, "wb") as seed:
+                    seed.write(b"\0")
+            self._handle = open(self.path, "r+b")
+        except OSError:
+            return True  # cannot create a lock file - do not block startup over it
+
+        try:
+            self._handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
+            self._handle = None
+            return False
+
+        try:
+            self.pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+        return True
+
+    def release(self):
+        if not self._handle:
+            return
+        try:
+            self._handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            self._handle.close()
+        except OSError:
+            pass
+        self._handle = None
+        # The lock file itself stays: it carries no meaning once unlocked, and
+        # removing it would race a instance that is opening it right now.
+        try:
+            self.pid_path.unlink()
+        except OSError:
+            pass
+
+
 class MapReplayService:
     """Main service that orchestrates real-time replay generation."""
     
@@ -2462,9 +2552,31 @@ def main():
         print("Please specify --server-root or run from within Mod MapReplay directory")
         sys.exit(1)
     
-    # Start service
-    service = MapReplayService(config)
-    service.start()
+    # Refuse to run alongside another instance. Two services happily render the
+    # same game to the same filename, and their ffmpeg processes interleave into
+    # one file - producing a video with two moov atoms that no player will open,
+    # while both instances log "Game replay saved" and exit cleanly. Silent
+    # corruption is the worst possible failure here, so make it loud instead.
+    lock = SingleInstanceLock(SCRIPT_DIR / "mapreplay_service.lock")
+    if not lock.acquire():
+        print("=" * 60)
+        print("  Another MapReplay service is already running.")
+        print(f"  Lock: {lock.path}")
+        if lock.holder_pid:
+            print(f"  Held by PID: {lock.holder_pid}")
+        print()
+        print("  Two instances would overwrite each other's videos and produce")
+        print("  unplayable files. Stop the other one first, or ignore this if")
+        print("  it is a leftover from a closed terminal (end the process).")
+        print("=" * 60)
+        sys.exit(1)
+
+    try:
+        # Start service
+        service = MapReplayService(config)
+        service.start()
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
