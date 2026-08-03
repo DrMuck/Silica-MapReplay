@@ -1032,15 +1032,22 @@ def select_game_interactive(log_path: Path) -> Optional[int]:
         try:
             choice = input("Select game number (0 for start of file, Enter for last game): ").strip()
             
+            # Returns the 1-based line number exactly as shown in the 'Start'
+            # column, matching --start-line. load_log() does the single
+            # conversion to a slice index. This used to return start_line - 1,
+            # so the two entry paths disagreed by one and a later fix to
+            # --start-line silently shifted --select-game a line earlier - onto
+            # the line before 'Loading map', which in a rotated log can be hours
+            # older and left the emulator sleeping out a phantom gap.
             if choice == "":
-                return games[-1][0] - 1 if games else 0  # start_line is index 0
-            
+                return games[-1][0] if games else 0
+
             choice = int(choice)
-            
+
             if choice == 0:
                 return 0
             elif 1 <= choice <= len(games):
-                return games[choice - 1][0] - 1  # start_line is index 0
+                return games[choice - 1][0]
             else:
                 print("Invalid choice.")
         except ValueError:
