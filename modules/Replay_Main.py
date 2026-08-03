@@ -361,6 +361,15 @@ def make_video():
     if orig_w != target_size or orig_h != target_size:
         base_map = base_map.resize((int(target_size), int(target_size)), resample=Image.BICUBIC)
         print(f"Scaled map from {orig_w}x{orig_h} to {base_map.size[0]}x{base_map.size[1]}")
+
+    # Reference grid, drawn once onto the base map (see renderer.draw_grid_overlay)
+    if getattr(config, "ENABLE_GRID_OVERLAY", False):
+        try:
+            from renderer import draw_grid_overlay
+            base_map = draw_grid_overlay(base_map)
+        except Exception as e:
+            print(f"[WARN] Could not draw grid overlay: {e}")
+
     timing.stop('map_loading')
     
     if t_end <= t_start:

@@ -456,6 +456,31 @@ TEST_RENDER_FRAMES = 300
 # Feature flags
 ENABLE_KILLBAR = True
 ENABLE_CHAT_PANEL = True  # Show chat messages below killbar
+
+# ---------------------------------------------------------------------------
+# Map grid overlay
+# ---------------------------------------------------------------------------
+# Reference grid drawn over the map so positions can be called out ("Behemoth
+# push through C6"). Columns are lettered A.. left to right, rows numbered 1..
+# top to bottom, matching how a map is normally read.
+#
+# Drawn once onto the base map when a game starts, not per frame, so it costs
+# nothing during rendering.
+ENABLE_GRID_OVERLAY = True
+GRID_DIVISIONS = 8                    # 8 -> A-H x 1-8
+
+GRID_LINE_COLOR = (255, 255, 255)
+GRID_LINE_ALPHA = 55                  # faint: must not compete with units
+GRID_LINE_WIDTH = 1
+
+GRID_LABEL_COLOR = (255, 255, 255)
+GRID_LABEL_ALPHA = 165
+# Label height as a fraction of one cell, so it scales with resolution.
+GRID_LABEL_SCALE = 0.10
+GRID_LABEL_MARGIN = 0.02              # inset from the cell edge, in cell widths
+# Labels sit on dark and light terrain alike, so they carry a dark outline.
+GRID_LABEL_OUTLINE = (0, 0, 0)
+GRID_LABEL_OUTLINE_WIDTH = 2
 ENABLE_STATS_PANEL = True
 ENABLE_KILL_ICONS = True
 ENABLE_ATTACK_LINES = True

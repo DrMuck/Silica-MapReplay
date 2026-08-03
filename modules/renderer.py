@@ -54,6 +54,66 @@ def get_icon_scale():
     return config.ICON_SCALE
 
 
+def draw_grid_overlay(map_img, divisions=None):
+    """
+    Return a copy of the base map with an A-H x 1-8 reference grid drawn on it.
+
+    Columns are lettered left to right, rows numbered top to bottom, so a
+    position reads as "C6" the way a map normally would.
+
+    Always works on a copy: the base map may come from the shared asset-pack
+    cache, and drawing into it would leave the grid baked into every later
+    game that loads the same map.
+
+    Called once when a game starts, so nothing here runs per frame.
+    """
+    from PIL import Image, ImageDraw
+
+    if divisions is None:
+        divisions = getattr(config, "GRID_DIVISIONS", 8)
+    if divisions < 1:
+        return map_img
+
+    base = map_img.convert("RGBA").copy()
+    w, h = base.size
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    line_rgba = (*config.GRID_LINE_COLOR, config.GRID_LINE_ALPHA)
+    width = max(1, int(config.GRID_LINE_WIDTH))
+
+    # Interior lines only - the map border already bounds the outer cells.
+    for i in range(1, divisions):
+        x = round(i * w / divisions)
+        y = round(i * h / divisions)
+        draw.line([(x, 0), (x, h)], fill=line_rgba, width=width)
+        draw.line([(0, y), (w, y)], fill=line_rgba, width=width)
+
+    cell_w = w / divisions
+    cell_h = h / divisions
+    font = get_cached_font(max(8, int(cell_h * config.GRID_LABEL_SCALE)))
+    label_rgba = (*config.GRID_LABEL_COLOR, config.GRID_LABEL_ALPHA)
+    outline_rgba = (*config.GRID_LABEL_OUTLINE, config.GRID_LABEL_ALPHA)
+    margin_x = cell_w * config.GRID_LABEL_MARGIN
+    margin_y = cell_h * config.GRID_LABEL_MARGIN
+
+    def label(text, x, y, anchor):
+        draw.text((x, y), text, font=font, fill=label_rgba, anchor=anchor,
+                  stroke_width=config.GRID_LABEL_OUTLINE_WIDTH,
+                  stroke_fill=outline_rgba)
+
+    # Column letters along the top, row numbers down the left edge. Beyond 26
+    # columns the letters would wrap, so fall back to numbers for the columns.
+    for i in range(divisions):
+        col = chr(ord("A") + i) if divisions <= 26 else str(i + 1)
+        label(col, i * cell_w + cell_w / 2, margin_y, "ma")
+    for j in range(divisions):
+        label(str(j + 1), margin_x, j * cell_h + cell_h / 2, "lm")
+
+    base.alpha_composite(overlay)
+    return base
+
+
 # Team prefixes to strip from AI unit names in killbar
 _TEAM_PREFIXES = ("Sol_", "Cent_", "Alien_")
 

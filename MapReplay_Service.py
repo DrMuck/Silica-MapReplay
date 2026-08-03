@@ -1492,6 +1492,16 @@ class LiveFrameGenerator:
                     resample=Image.BICUBIC
                 )
             
+            # Reference grid, burned into the base map once so it costs nothing
+            # per frame. draw_grid_overlay() copies, leaving the shared
+            # asset-pack image untouched for later games on the same map.
+            if getattr(cfg, "ENABLE_GRID_OVERLAY", False):
+                try:
+                    from renderer import draw_grid_overlay
+                    self.base_map = draw_grid_overlay(self.base_map)
+                except Exception as e:
+                    self.logger.warning(f"Could not draw grid overlay: {e}")
+
             self.logger.info(f"Loaded map: {game.map_name} ({self.base_map.size})")
             
         except Exception as e:
