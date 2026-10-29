@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-29
+
+### Fix: midnight rollover re-read the whole day and split the running round
+- `LogFileWatcher` picked the "latest" log by modification time. At 00:00:01 the
+  old day's file receives its `Log file closed` line in the same second the new
+  day's file is created, so after closing `L20261028.log` the lookup returned
+  that **same file** and reopened it from byte 0. The whole day was re-parsed:
+  the 23:37 `Round_Start` was taken for a new game, the running video was
+  finalized and deleted as a 0-minute game, and the rest of the round was
+  rendered with a 1360 s SRPL offset (`_start_unix` was the wall clock at
+  *detection*, 22 minutes after the line's own time).
+- Log files named `L<YYYYMMDD>.log` are now ordered by that date (mtime only
+  breaks ties), and the file closed on `Log file closed` is never a candidate
+  again.
+- `LiveLogParser` ignores a `Round_Start` whose time equals the running game's
+  start (a re-read), and takes `_start_unix` from the log line's own timestamp
+  instead of `time.time()`, so a backlog never shifts the SRPL alignment.
+
+### Fix: graph lines drawn outside the plot area
+- Kill statistics come from the SRPL with the offset subtracted; the wrong
+  offset above made the first 22 minutes of kills negative and
+  `PILGraphRenderer.draw_line` drew them straight across the y-axis labels.
+  Every segment is now clipped to the plot rectangle (Liang-Barsky), for all
+  four line styles. The axes are the contract.
+
 ## 2026-08-02
 
 ### Fix: killbar stopped showing events entirely

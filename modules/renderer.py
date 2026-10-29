@@ -1644,21 +1644,72 @@ class PILGraphRenderer:
             y_pos = y_center - rotated.height // 2
             self._pending_y_label = (rotated, x_pos, y_pos)
     
-    def draw_line(self, draw, x_data, y_data, x_min, x_max, y_min, y_max, 
+    def _clip_segment(self, p1, p2):
+        """Liang-Barsky clip of a pixel segment to the plot rectangle; None when fully outside."""
+        x1, y1 = p1
+        x2, y2 = p2
+        dx, dy = x2 - x1, y2 - y1
+        t0, t1 = 0.0, 1.0
+        for p, q in ((-dx, x1 - self.plot_left), (dx, self.plot_right - x1),
+                     (-dy, y1 - self.plot_top), (dy, self.plot_bottom - y1)):
+            if p == 0:
+                if q < 0:
+                    return None
+                continue
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    return None
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return None
+                if r < t1:
+                    t1 = r
+        return ((int(x1 + t0 * dx), int(y1 + t0 * dy)), (int(x1 + t1 * dx), int(y1 + t1 * dy)))
+
+    def _clipped_segments(self, points):
+        """Consecutive point pairs, each cut to the plot area, outside parts dropped."""
+        out = []
+        for i in range(len(points) - 1):
+            seg = self._clip_segment(points[i], points[i + 1])
+            if seg is not None:
+                out.append(seg)
+        return out
+
+    def draw_line(self, draw, x_data, y_data, x_min, x_max, y_min, y_max,
                   color=(255, 255, 255), width=2, style='solid'):
-        """Draw a line on the graph."""
+        """Draw a line on the graph, clipped to the plot area.
+
+        Data outside [x_min, x_max] x [y_min, y_max] must not reach the canvas:
+        a mis-aligned timeline (negative times after a wrong SRPL offset,
+        2026-10-29) was drawn straight across the y-axis labels and the
+        legend. The axes are the contract; everything is cut at them.
+        """
         if len(x_data) < 2:
             return
-        
-        points = []
+
+        raw = []
         for x, y in zip(x_data, y_data):
             px, py = self.data_to_pixel(x, y, x_min, x_max, y_min, y_max)
-            points.append((px, py))
-        
+            raw.append((px, py))
+        segments = self._clipped_segments(raw)
+        if not segments:
+            return
+        # Every style below walks points[i] -> points[i + 1]; feed it the
+        # clipped pairs as a flat list. The pair (end of one segment, start
+        # of the next) is either zero-length (skipped by the styles) or lies
+        # on the plot border where the line left and re-entered the area.
+        points = []
+        for a, b in segments:
+            points.append(a)
+            points.append(b)
+
         if style == 'solid':
             # Draw solid line
-            for i in range(len(points) - 1):
-                draw.line([points[i], points[i + 1]], fill=(*color, 230), width=width)
+            for a, b in segments:
+                draw.line([a, b], fill=(*color, 230), width=width)
         
         elif style == 'dotted':
             # Draw dotted line (dots every 4 pixels)

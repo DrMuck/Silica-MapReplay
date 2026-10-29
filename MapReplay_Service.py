@@ -21,6 +21,7 @@ Version: 1.0.0
 """
 
 import os
+import re
 import sys
 import time
 import glob
@@ -491,6 +492,15 @@ class LogFileWatcher:
         self.file_position: int = 0
         self.last_check_time: float = 0
         self.was_truncated: bool = False  # consumed by the service to reset its clock
+        # The file we left on its "Log file closed" line. 2026-10-29 00:00:02:
+        # after closing L20261028.log the newest-by-mtime lookup returned that
+        # SAME file (both days' files had just been written within the same
+        # second), it was reopened from byte 0, the whole day re-parsed, the
+        # 23:37 Round_Start taken for a new game, the running video finalized
+        # and deleted as "too short", and the rest of the round rendered with a
+        # 1360 s SRPL offset (kills drawn left of the graph axis). A closed
+        # file is never a candidate again.
+        self.closed_file: Optional[Path] = None
     
     def set_log_dir(self, log_dir: Path, from_end: bool = True) -> bool:
         """
@@ -518,16 +528,35 @@ class LogFileWatcher:
             return False
         return self.open_file(latest, from_end=from_end)
 
+    _DATE_IN_NAME = re.compile(r"^L(\d{8})\.log$", re.IGNORECASE)
+
     def get_latest_log_file(self) -> Optional[Path]:
-        """Find the most recent log file in the directory."""
+        """Find the most recent log file in the directory.
+
+        Files named L<YYYYMMDD>.log are ordered by that date, which is what
+        "latest" means at midnight: the old day's file gets its "Log file
+        closed" line in the same second the new day's file is created, so
+        mtime cannot tell them apart. Modification time only breaks ties and
+        orders files that do not follow the naming scheme (emulator output).
+        A file we closed on its "Log file closed" line is never returned.
+        """
         if not self.log_dir.is_dir():
             return None
-        log_files = list(self.log_dir.glob(self.pattern))
+        log_files = [f for f in self.log_dir.glob(self.pattern)
+                     if self.closed_file is None or f != self.closed_file]
         if not log_files:
             return None
-        
-        # Sort by modification time (most recent first)
-        log_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+        def key(f: Path):
+            m = self._DATE_IN_NAME.match(f.name)
+            date_key = int(m.group(1)) if m else 0
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (date_key, mtime)
+
+        log_files.sort(key=key, reverse=True)
         return log_files[0]
     
     def get_log_file_for_date(self, date: datetime) -> Path:
@@ -542,6 +571,7 @@ class LogFileWatcher:
         try:
             self.file_handle = open(file_path, 'r', encoding='utf-8', errors='ignore')
             self.current_file = file_path
+            self.closed_file = None
             
             if from_end:
                 # Seek to end of file (for starting fresh)
@@ -809,6 +839,19 @@ class LiveLogParser:
         # Date extraction for cleanlog format
         self.re_date_cleanlog = re.compile(r'L (\d{2})/(\d{2})/(\d{4}) -')
     
+    _LINE_STAMP = re.compile(r"^L (\d{2})/(\d{2})/(\d{4}) - (\d{2}):(\d{2}):(\d{2}):")
+
+    def line_unix_time(self, line: str) -> float:
+        """Wall time of a log line ("L MM/DD/YYYY - HH:MM:SS: ...") as local unix seconds, 0 if absent."""
+        m = self._LINE_STAMP.match(line)
+        if not m:
+            return 0.0
+        try:
+            mo, d, y, hh, mm, ss = (int(g) for g in m.groups())
+            return datetime(y, mo, d, hh, mm, ss).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return 0.0
+
     def parse_time(self, line: str) -> Optional[float]:
         """Extract timestamp from log line and handle midnight rollover."""
         # Try standard format first: [HH:MM:SS.mmm]
@@ -941,6 +984,17 @@ class LiveLogParser:
                 is_gameplay_event = False
 
         if m_start or is_gameplay_event:
+            # THE SAME ROUND SEEN TWICE IS NOT A NEW ROUND. A log re-read (a
+            # reopened file, a seek back to 0) replays the Round_Start of the
+            # game that is already running; starting it again finalizes the
+            # video, deletes it as a zero-minute game and restarts rendering
+            # with a wrong SRPL offset. Same start second: ignore.
+            if (m_start and self.current_game and not self.current_game.is_ended
+                    and abs(self.current_game.start_time - t_abs) < 1.0):
+                self.logger.warning(
+                    f"Round_Start at t={t_abs:.0f}s repeats the running game's start "
+                    f"({self.current_game.map_name}) - ignoring the duplicate")
+                return "event"
             if m_start:
                 gametype = m_start.group(1)
             else:
@@ -979,7 +1033,11 @@ class LiveLogParser:
             self._pending_map_name = None  # Clear for next game
 
             self.current_game = LiveGameState(map_name, gametype, t_abs)
-            self.current_game._start_unix = time.time()
+            # The SRPL offset is log start minus SRPL start, both on the
+            # server's clock. The log line carries its own wall time; the
+            # moment WE read the line only matches it while the service keeps
+            # up, and is minutes late after a backlog (re-read, restart).
+            self.current_game._start_unix = self.line_unix_time(line) or time.time()
 
             # Extract date from log line
             log_date = self.extract_date(line)
@@ -2391,6 +2449,7 @@ class MapReplayService:
                 # Check for log file closed
                 if self.log_watcher.check_for_log_closed(line):
                     self.logger.info("Log file closed (midnight rollover)")
+                    self.log_watcher.closed_file = self.log_watcher.current_file
                     self.log_watcher.close_file()
                     continue
                 
