@@ -59,6 +59,10 @@ GAME_END_TIMEOUT = 180
 # Set to True when testing with Log_Emulator to avoid premature game endings
 DISABLE_TIMEOUT_END = False
 
+# Suppress chat command messages from the replay (e.g. /b, /1 through /30)
+# These are used by the balance UI and clutter the chat panel
+SUPPRESS_CHAT_COMMANDS = True
+
 # Game types to process (leave empty for all)
 # Options: "HUMANS_VS_HUMANS_VS_ALIENS", "HUMANS_VS_ALIENS", "HUMANS_VS_HUMANS"
 GAMETYPE_FILTER = []  # Empty = process all game types
@@ -124,6 +128,10 @@ DISCORD_WEBHOOK_ENABLED = False
 # Discord webhook URL - get this from your Discord server settings
 # Server Settings -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL
 # Example: "https://discord.com/api/webhooks/1234567890/abcdefghijklmnop..."
+# Server name shown in Discord messages
+# Leave empty ("") to auto-detect from ~/Documents/Silica/ServerSettings.xml
+SERVER_NAME = ""
+
 DISCORD_WEBHOOK_URL = ""
 
 # Upload timeout in seconds (increase for slow connections)
