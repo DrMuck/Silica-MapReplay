@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-02
+
+### Assets refreshed from the current Silica build (extracted 2026-10-29)
+- `assets.pak` rebuilt with `extract_game_assets.py`: 7 new icons (AntiAir,
+  Light and UltraHeavy turrets, JetBike, RepairRig, RepairTruck, Wildlife logo)
+  and 15 updated images (Citadel and IndustrialQuarter map art, air vehicle and
+  ground vehicle icons).
+
 ## 2026-10-29
 
 ### Fix: midnight rollover re-read the whole day and split the running round
